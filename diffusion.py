@@ -1,16 +1,15 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from util import ResidualBlock, MultiHeadAttentionBlock
+from util import MultiHeadAttentionBlock, CrossAttentionBlock
 
-
-class TimeEncoding(nn.Module):
+class TimeEmbedding(nn.Module):
     """
     Time encoding for diffusion models, encode time steps in to the 
     input tensors (batch_size, channels, height, width)
     d_time is the size of the time embedding vector, equal to the number of channels
     """
-    def __init__(self, d_time: int, dropout: float = 0.1):
+    def __init__(self, d_time: int, time: int, dropout: float = 0.1, batch_size: int = 1):
         """
         Args:
             d_time: the size of the encoding vector
@@ -46,3 +45,28 @@ class TimeEncoding(nn.Module):
         x = x + time_encoding
         return self.dropout(x)
     
+
+class Diffusion(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.time_embedding = TimeEmbedding(320)
+        self.unet = Unet()
+        self.final = Unet_Output(320, 4)
+
+    def forward(self, latent: torch.Tensor, context: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            latent: the latent tensor of shape (batch_size, latent_space_size (4), height / 16, width / 16)
+            context: the context tensor of shape (batch_size, seq_len, token_dim)
+            times: the time steps need to be encoded, shape (1, 320)
+        Returns:
+            the output tensor of shape (batch_size, channels, height, width)
+        """
+        # (1, 320) -> (1, 1280)
+        time = self.time_embedding(time)
+        # (batch_size, 4, height / 8, width / 8) -> (batch_size, 320, height / 8, width / 8)
+        x = self.unet(latent, time, context)
+        # (batch_size, 320, height / 8, width / 8) -> (batch_size, 4, height / 8, width / 8)
+        final = self.final(x)
+        return final
