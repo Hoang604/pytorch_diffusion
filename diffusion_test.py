@@ -9,12 +9,12 @@ import os
 from datetime import datetime
 import math
 import matplotlib.pyplot as plt
-from test import UNet
+from unet_test import UNet
 from util import SinusoidalPositionEmbeddings
 
 # --- PyTorch Gradient Accumulator ---
 class GradientAccumulatorPyTorch:
-    def __init__(self, model, optimizer, steps=32, device='cpu'):
+    def __init__(self, model, optimizer, steps=32, device='cuda'):
         """
         Initializes the Gradient Accumulator for PyTorch.
 
@@ -22,7 +22,7 @@ class GradientAccumulatorPyTorch:
             model (nn.Module): The PyTorch model.
             optimizer (optim.Optimizer): The PyTorch optimizer.
             steps (int): The number of steps to accumulate gradients over.
-            device (str or torch.device): The device to run on ('cpu' or 'cuda').
+            device (str or torch.device): The device to run on ('cuda' or 'cpu').
         """
         self.model = model
         self.optimizer = optimizer
@@ -84,7 +84,7 @@ class DiffusionModelPyTorch:
         img_size=32,
         img_channels=3,
         timesteps=1000,
-        device='cpu' # Add device parameter
+        device='cuda' # Add device parameter
     ):
         """
         Initialize the diffusion model in PyTorch.
@@ -93,7 +93,7 @@ class DiffusionModelPyTorch:
             img_size (int): Image dimensions (assumed square).
             img_channels (int): Number of image channels.
             timesteps (int): Number of diffusion steps.
-            device (str or torch.device): Device for tensors ('cpu' or 'cuda').
+            device (str or torch.device): Device for tensors ('cuda' or 'cpu').
         """
         self.img_size = img_size
         self.img_channels = img_channels
@@ -141,17 +141,15 @@ class DiffusionModelPyTorch:
         Add noise to images following the forward diffusion process (PyTorch version).
 
         Args:
-            x_0 (torch.Tensor): Input images, shape [B, C, H, W]. Assumed to be in [0, 255] range initially.
+            x_0 (torch.Tensor): Input images, shape [B, C, H, W]. Assumed to be in [-1 , 1] range initially.
             t (torch.Tensor): Timesteps, shape [B].
 
         Returns:
             torch.Tensor: Noisy images x_t at timestep t, range [-1, 1].
             torch.Tensor: The noise added to the images.
         """
-        # Cast to float32, normalize to [0, 1], then scale to [-1, 1]
-        x_0 = x_0.float() / 255.0
-        x_0 = x_0 * 2.0 - 1.0
-        x_0 = torch.clamp(x_0, -1.0, 1.0) # Use PyTorch's clamp
+        x_0 = x_0.to(self.device) # Move to correct device
+        x_0 = x_0.float()
 
         # Create random noise
         noise = torch.randn_like(x_0, device=x_0.device)
@@ -227,8 +225,8 @@ class DiffusionModelPyTorch:
 
                 # Log images periodically (less frequently than every batch usually)
                 if batch_step % 500 == 0:
-                     # Log original images (normalize [0, 255] to [0, 1])
-                    writer.add_images("Original Images", x_batch.float() / 255.0, global_step=batch_step, dataformats='NCHW')
+                     # Log original images (normalize [-1, 1] to [0, 1])
+                    writer.add_images("Original Images", (x_batch.float() + 1) / 2, global_step=batch_step, dataformats='NCHW')
                      # Log noisy images (normalize [-1, 1] to [0, 1])
                     writer.add_images("Noisy Images", (x_t + 1.0) / 2.0, global_step=batch_step, dataformats='NCHW')
 
@@ -358,53 +356,90 @@ class DiffusionModelPyTorch:
         print("Image generation complete.")
         return generated_images
 
-    def save_model_weights(self, model, save_path):
+    def save_model(self, model, save_path, optimizer=None, epoch=None, loss=None, save_weights_only=False):
         """
-        Save only the model's state_dict (weights).
-
+        Save model - either weights only or full checkpoint including training state.
+    
         Args:
             model (nn.Module): The trained PyTorch model.
-            save_path (str): Path to save the weights file (e.g., 'model.pth').
+            save_path (str): Path to save the model file (e.g., 'model.pth').
+            optimizer (torch.optim.Optimizer, optional): The optimizer to save state.
+            epoch (int, optional): Current training epoch.
+            loss (float, optional): Current/best loss value.
+            save_weights_only (bool, optional): If True, save only weights. Default: False.
         """
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        torch.save(model.state_dict(), save_path)
-        print(f"Model weights saved to {save_path}")
+        
+        if save_weights_only:
+            # Save only model weights (state_dict)
+            torch.save(model.state_dict(), save_path)
+            print(f"Model weights saved to {save_path}")
+        else:
+            # Save full checkpoint with training state
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+            }
+            
+            # Add optional components if provided
+            if optimizer is not None:
+                checkpoint['optimizer_state_dict'] = optimizer.state_dict()
+            
+            if epoch is not None:
+                checkpoint['epoch'] = epoch
+                
+            if loss is not None:
+                checkpoint['loss'] = loss
+                
+            torch.save(checkpoint, save_path)
+            print(f"Full model checkpoint saved to {save_path}")
+            
+            # Print additional info about what was saved
+            components = []
+            if 'model_state_dict' in checkpoint: components.append("model weights")
+            if 'optimizer_state_dict' in checkpoint: components.append("optimizer state")
+            if 'epoch' in checkpoint: components.append(f"epoch {epoch}")
+            if 'loss' in checkpoint: components.append(f"loss {loss:.6f}")
+            
+            print(f"Saved: {', '.join(components)}")
 
-    def load_model_weights(self, model, model_path):
+    def load_model_weights(self, model, model_path, verbose=False):
         """
-        Load model weights from a state_dict file.
-
+        Load model weights from a checkpoint, supporting different architectures.
+    
         Args:
-            model (nn.Module): The PyTorch model instance (must have the same architecture).
+            model (nn.Module): The PyTorch model instance.
             model_path (str): Path to the saved weights file.
+            verbose (bool): Whether to print detailed information about missing/unexpected keys.
         """
         if os.path.exists(model_path):
-             # Load state dict, mapping to the model's device
-            state_dict = torch.load(model_path, map_location=self.device)
-            model.load_state_dict(state_dict)
-            model.to(self.device) # Ensure model is on the correct device
-            print(f"Model weights loaded from {model_path}")
+            # Tải toàn bộ checkpoint
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+            
+            # Trích xuất state_dict (tùy cấu trúc của checkpoint)
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+            
+            # Tải với strict=False để bỏ qua các parameters không khớp
+            incompatible_keys = model.load_state_dict(state_dict, strict=False)
+            
+            # In thông tin về các keys đã được load và keys bị bỏ qua
+            if incompatible_keys.missing_keys:
+                print(f"Warning: {len(incompatible_keys.missing_keys)} keys in model were not loaded")
+                if verbose:
+                    print(f"Missing keys: {incompatible_keys.missing_keys}")
+                    
+            if incompatible_keys.unexpected_keys:
+                print(f"Info: {len(incompatible_keys.unexpected_keys)} keys in checkpoint were not used")
+                if verbose:
+                    print(f"Unused keys: {incompatible_keys.unexpected_keys}")
+            
+            # Đảm bảo model ở đúng device
+            model.to(self.device)
+            
+            # In thông tin tổng quát
+            print(f"Partial weights loaded from {model_path}")
+            print(f"Successfully loaded {len(state_dict) - len(incompatible_keys.unexpected_keys)} compatible parameters")
         else:
             print(f"Warning: Model weights path not found: {model_path}")
-
-
-    def convert_to_raw_images(self, images_tensor):
-        """
-        Convert generated PyTorch tensors to numpy arrays in uint8 format.
-
-        Args:
-            images_tensor (torch.Tensor): Generated images tensor ([N, C, H, W], range [0, 1]).
-
-        Returns:
-            np.ndarray: Raw images in uint8 format ([N, H, W, C]).
-        """
-        # Ensure tensor is on CPU and detach from graph
-        images_tensor = images_tensor.detach().cpu()
-        # Permute channels from NCHW to NHWC for standard image format
-        images_tensor = images_tensor.permute(0, 2, 3, 1)
-        # Scale to [0, 255] and convert to uint8
-        images_np = (images_tensor * 255.0).clamp(0, 255).byte().numpy()
-        return images_np
 
     @torch.no_grad()
     def visualize_diffusion_steps(self, model, x_0_tensor, num_steps_to_show=10):
@@ -425,7 +460,7 @@ class DiffusionModelPyTorch:
              raise ValueError("Input tensor x_0_tensor must have 3 or 4 dimensions")
 
         # Select timesteps
-        step_indices = torch.linspace(0, self.timesteps - 1, num_steps_to_show, dtype=torch.long, device='cpu') # Use cpu for indices
+        step_indices = torch.linspace(0, self.timesteps - 1, num_steps_to_show, dtype=torch.long, device='cuda') # Use cuda for indices
 
         # Forward process
         forward_images = []
@@ -433,9 +468,9 @@ class DiffusionModelPyTorch:
         for t_int in step_indices.tolist():
             t = torch.tensor([t_int], device=self.device) # Create tensor for timestep
             noisy_image_t, _ = self.q_sample(x_0_batch, t) # Use q_sample
-            # Convert [-1, 1] to [0, 1] for display, move to CPU, remove batch dim
-            img_display = (noisy_image_t[0].cpu() + 1.0) / 2.0
-            forward_images.append(img_display.permute(1, 2, 0).clamp(0, 1).numpy()) # CHW to HWC
+            # Convert [-1, 1] to [0, 1] for display, move to cuda, remove batch dim
+            img_display = (noisy_image_t[0].to(self.device) + 1.0) / 2.0
+            forward_images.append(img_display.permute(1, 2, 0).clamp(0, 1).cpu().numpy()) # CHW to HWC
 
         # Reverse process
         reverse_images = []
@@ -448,8 +483,8 @@ class DiffusionModelPyTorch:
             x_t = self.p_sample(model, x_t, t_int)
             # Store image if the timestep matches one we want to visualize
             if current_vis_idx < len(timesteps_for_reverse_vis) and t_int == timesteps_for_reverse_vis[current_vis_idx]:
-                img_display = (x_t[0].cpu() + 1.0) / 2.0 # Convert [-1, 1] to [0, 1]
-                reverse_images.append(img_display.permute(1, 2, 0).clamp(0, 1).numpy()) # CHW to HWC
+                img_display = (x_t[0].to(self.device) + 1.0) / 2.0 # Convert [-1, 1] to [0, 1]
+                reverse_images.append(img_display.permute(1, 2, 0).clamp(0, 1).cpu().numpy()) # CHW to HWC
                 current_vis_idx += 1
 
         # Reverse the collected reverse images to show T -> 0 order

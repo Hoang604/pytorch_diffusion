@@ -3,36 +3,40 @@ from torch import nn
 from torch.nn import functional as F
 from util import ResidualBlock, SinusoidalPositionEmbeddings
 from clip import CLIP
+from typing import Optional
+from torchinfo import summary
 
 class BasicTransformerBlock(nn.Module):
     """
     Combines Self-Attention, Cross-Attention, and FeedForward using nn.MultiheadAttention.
     Operates on inputs of shape (B, C, H, W).
+    Cross-Attention is applied conditionally based on context availability.
     """
     def __init__(self, dim: int, context_dim: int, n_head: int, dropout: float = 0.1):
         """
         Args:
             dim (int): Input dimension (channels)
-            context_dim (int): Dimension of context embeddings
+            context_dim (int): Dimension of context embeddings (only used if context is provided)
             n_head (int): Number of attention heads
             dropout (float): Dropout rate
         """
-
         super().__init__()
         self.dim = dim
-        # LayerNorms - Applied on the sequence representation (..., N, C)
+        # LayerNorms
         self.norm_self_attn = nn.LayerNorm(dim)
-        self.norm_cross_attn = nn.LayerNorm(dim)
+        self.norm_cross_attn = nn.LayerNorm(dim) # Norm before cross-attention
         self.norm_ff = nn.LayerNorm(dim)
 
-        # Attention Layers using PyTorch's optimized implementation
-        # Note: embed_dim is the dimension of the query (image features)
+        # Self-Attention Layer
         self.self_attn = nn.MultiheadAttention(
             embed_dim=dim,
             num_heads=n_head,
             dropout=dropout,
             batch_first=True # Expect input (B, N, C)
         )
+
+        # Cross-Attention Layer (will be used conditionally)
+        # We define it here, but only use it in forward if context is not None
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=dim,        # Query dimension (from image features x)
             kdim=context_dim,     # Key dimension (from context)
@@ -43,7 +47,6 @@ class BasicTransformerBlock(nn.Module):
         )
 
         # FeedForward Layer
-        # Input/Output shape: (..., N, C)
         self.ff = nn.Sequential(
             nn.Linear(dim, dim * 4),
             nn.GELU(),
@@ -51,49 +54,38 @@ class BasicTransformerBlock(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: (B, C, H, W) - Image features
-        # context: (B, seq_len_ctx, C_context) - Text context embeddings
+        # context: Optional[(B, seq_len_ctx, C_context)] - Text context embeddings or None
         batch_size, channels, height, width = x.shape
         n_tokens_img = height * width
-        residual = x # Keep original shape for final addition
+        # Note: No residual = x here, residuals are added after each block
 
         # --- Reshape for Sequence Processing ---
         # (B, C, H, W) -> (B, C, N) -> (B, N, C)
         x_seq = x.view(batch_size, channels, n_tokens_img).transpose(1, 2)
 
         # --- Self-Attention ---
-        # Norm applied on (B, N, C)
         x_norm = self.norm_self_attn(x_seq)
-        # nn.MultiheadAttention expects Q, K, V. For self-attn, they are the same.
         self_attn_out, _ = self.self_attn(query=x_norm, key=x_norm, value=x_norm, need_weights=False)
-        # Add residual connection in sequence format
-        x_seq = x_seq + self_attn_out
+        x_seq = x_seq + self_attn_out # Add residual
 
-        # --- Cross-Attention ---
-        # Norm applied on (B, N, C)
-        x_norm = self.norm_cross_attn(x_seq)
-        # Q is from image (x_norm), K and V are from context
-        cross_attn_out, _ = self.cross_attn(query=x_norm, key=context, value=context, need_weights=False)
-        # Add residual connection in sequence format
-        x_seq = x_seq + cross_attn_out
+        # --- Cross-Attention (Conditional) ---
+        # Only perform cross-attention if context is provided
+        if context is not None:
+            x_norm = self.norm_cross_attn(x_seq)
+            cross_attn_out, _ = self.cross_attn(query=x_norm, key=context, value=context, need_weights=False)
+            x_seq = x_seq + cross_attn_out # Add residual only if cross-attn was performed
+        # If context is None, this block is skipped
 
         # --- FeedForward ---
-        # Norm applied on (B, N, C)
         x_norm = self.norm_ff(x_seq)
-        # FF operates on (B, N, C)
         ff_out = self.ff(x_norm)
-        # Add residual connection in sequence format
-        x_seq = x_seq + ff_out
+        x_seq = x_seq + ff_out # Add residual
 
         # --- Reshape back to Image Format ---
         # (B, N, C) -> (B, C, N) -> (B, C, H, W)
         out = x_seq.transpose(1, 2).view(batch_size, channels, height, width)
-
-        # The final residual connection should ideally be added *before* reshaping
-        # Let's reconsider the residual connections slightly for shape consistency.
-        # It's common to apply attention/FF and add residual *within* the sequence format.
-        # The code above does this correctly.
 
         return out # Return shape (B, C, H, W)
 
@@ -111,7 +103,7 @@ class UNet(nn.Module):
         dim_mults=(1, 2, 4, 8),     # Channel multipliers for each resolution level
         num_resnet_blocks=2,        # Number of ResNet blocks per level
         context_dim=768,            # Dimension of CLIP context embeddings
-        attn_heads=8,               # Number of attention heads
+        attn_heads=4,               # Number of attention heads
         dropout=0.1
     ):
         super().__init__()
@@ -170,8 +162,12 @@ class UNet(nn.Module):
                 stage_modules.append(make_resnet_block(dim_out, dim_out, actual_time_emb_dim))
 
             # Add Attention blocks (e.g., at lower resolutions)
-            if dim_out in [dims[-1], dims[-2]]: # add attention at last 2 resolutions
+            if dim_out in [dims[-2], dims[-3]]: # add attention at last 2 resolutions
                  stage_modules.append(make_attn_block(dim_out, attn_heads, context_dim))
+
+            if dim_out == dims[-1]: # Add more attention at the highest resolution
+                stage_modules.append(make_attn_block(dim_out, attn_heads * 2, context_dim))
+                stage_modules.append(make_attn_block(dim_out, attn_heads * 2, context_dim))
 
             # Add Downsample layer if not the last stage
             if not is_last:
@@ -184,7 +180,8 @@ class UNet(nn.Module):
         # -- Bottleneck --
         mid_dim = dims[-1]
         self.mid_block1 = make_resnet_block(mid_dim, mid_dim, actual_time_emb_dim)
-        self.mid_attn = make_attn_block(mid_dim, attn_heads, context_dim)
+        self.mid_attn1 = make_attn_block(mid_dim, attn_heads * 2, context_dim)
+        self.mid_attn2 = make_attn_block(mid_dim, attn_heads * 2, context_dim)
         self.mid_block2 = make_resnet_block(mid_dim, mid_dim, actual_time_emb_dim)
 
         # -- Decoder --
@@ -201,8 +198,12 @@ class UNet(nn.Module):
                 stage_modules.append(make_resnet_block(dim_in, dim_in, actual_time_emb_dim))
 
             # Add Attention blocks
-            if dim_in in [dims[-1], dims[-2]]: # Match encoder attention placement
+            if dim_in in [dims[-2], dims[-3]]: # Match encoder attention placement
                  stage_modules.append(make_attn_block(dim_in, attn_heads, context_dim))
+            
+            if dim_in == dims[-1]:  # Add more attention at the highest resolution
+                stage_modules.append(make_attn_block(dim_in, attn_heads * 2, context_dim))
+                stage_modules.append(make_attn_block(dim_in, attn_heads * 2, context_dim))
 
             # Add Upsample layer if not the last stage (output stage)
             if not is_last:
@@ -219,7 +220,7 @@ class UNet(nn.Module):
         self.final_conv = nn.Conv2d(base_dim, out_channels, kernel_size=1)
 
 
-    def forward(self, x: torch.Tensor, time: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, time: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             x (torch.Tensor): Input noisy tensor (B, C_in, H, W)
@@ -241,21 +242,25 @@ class UNet(nn.Module):
         for i, stage in enumerate(self.downs):
             res_block1 = stage[0] 
             res_blocks_rest = stage[1:self.num_resnet_blocks] # Indexing assumes fixed structure
-            attn_block = stage[self.num_resnet_blocks] if len(stage) > self.num_resnet_blocks + 1 else None # Check if attn exists
+            attn_block1 = stage[self.num_resnet_blocks] if len(stage) > self.num_resnet_blocks + 1 else None # Check if attn exists
+            attn_block2 = stage[self.num_resnet_blocks + 1] if len(stage) > self.num_resnet_blocks + 2 else None
             downsample = stage[-1]
 
             x = res_block1(x, t_emb)
             for res_block in res_blocks_rest:
                  x = res_block(x, t_emb)
-            if attn_block is not None:
-                x = attn_block(x, context)
+            if attn_block1 is not None:
+                x = attn_block1(x, context)
+            if attn_block2 is not None:
+                x = attn_block2(x, context)
 
             skip_connections.append(x) # Store output before downsampling
             x = downsample(x)
 
         # 4. Bottleneck
         x = self.mid_block1(x, t_emb)
-        x = self.mid_attn(x, context)
+        x = self.mid_attn1(x, context)
+        x = self.mid_attn2(x, context)
         x = self.mid_block2(x, t_emb)
 
         # 5. Decoder Path
@@ -267,6 +272,7 @@ class UNet(nn.Module):
             res_block1 = stage[0]
             res_blocks_rest = stage[1:self.num_resnet_blocks]
             attn_block = stage[self.num_resnet_blocks] if len(stage) > self.num_resnet_blocks + 1 else None
+            attn_block2 = stage[self.num_resnet_blocks + 1] if len(stage) > self.num_resnet_blocks + 2 else None
             upsample = stage[-1]
 
             x = torch.cat((skip, x), dim=1) # Concatenate along channel dimension
@@ -276,6 +282,8 @@ class UNet(nn.Module):
                 x = res_block(x, t_emb)
             if attn_block is not None:
                 x = attn_block(x, context)
+            if attn_block2 is not None:
+                x = attn_block2(x, context)
             
             x = upsample(x)
 
@@ -308,6 +316,13 @@ if __name__ == "__main__":
     dummy_x = torch.randn(batch_size, in_channels, img_size, img_size, device=device)
     dummy_time = torch.randint(0, time_steps, (batch_size,), device=device).long()
     dummy_tokens = torch.randint(0, 49408, (batch_size, clip_seq_len), device=device).long()
+    dummy_x_shape = dummy_x.shape
+    dummy_time_shape = dummy_time.shape
+    dummy_tokens_shape = dummy_tokens.shape
+    print(f"Input shape: {dummy_x_shape}")
+    print(f"Time shape: {dummy_time_shape}")
+    print(f"Tokens shape: {dummy_tokens_shape}")
+
 
     # --- Instantiate Models ---
     print("Instantiating CLIP...")
@@ -328,6 +343,19 @@ if __name__ == "__main__":
         dropout=0.1
     ).to(device)
     print("UNet instantiated.")
+    # Chỉ truyền input chính (hình ảnh) cho torchsummary
+    print("Model Summary:")
+    print(unet_model)    
+    # Thêm vào đoạn code trước khi chạy forward pass
+    summary(
+        unet_model, 
+        input_data=[
+            dummy_x,  # hình ảnh
+            dummy_time,  # timestep
+            clip_model(dummy_tokens)  # context từ CLIP
+        ],
+        depth=3  # độ sâu hiển thị layers
+    )
 
     # --- Run Inference ---
     print("Running inference...")
