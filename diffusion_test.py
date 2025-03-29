@@ -1,16 +1,11 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter # Use PyTorch's TensorBoard
 import numpy as np
 from tqdm import tqdm
 import os
 from datetime import datetime
-import math
 import matplotlib.pyplot as plt
-from unet_test import UNet
-from util import SinusoidalPositionEmbeddings
 
 # --- PyTorch Gradient Accumulator ---
 class GradientAccumulatorPyTorch:
@@ -142,7 +137,7 @@ class DiffusionModelPyTorch:
 
         Args:
             x_0 (torch.Tensor): Input images, shape [B, C, H, W]. Assumed to be in [-1 , 1] range initially.
-            t (torch.Tensor): Timesteps, shape [B].
+            t (torch.Tensor): Timesteps, shape [B,].
 
         Returns:
             torch.Tensor: Noisy images x_t at timestep t, range [-1, 1].
@@ -210,13 +205,17 @@ class DiffusionModelPyTorch:
                 # --- Timestep Sampling ---
                 # Sample random timesteps CORRECTLY
                 t = torch.randint(0, self.timesteps, (actual_batch_size,), device=self.device, dtype=torch.long)
-
                 # --- Forward Diffusion ---
                 x_t, noise_added = self.q_sample(x_batch, t)
+                sqrt_alphas_cumprod_t = self._extract(self.sqrt_alphas_cumprod, t, x_t.shape)
+                sqrt_one_minus_alphas_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
+
+                # v = sqrt(alpha_bar_t) * epsilon - sqrt(1 - alpha_bar_t) * x_0
+                target_v = sqrt_alphas_cumprod_t * noise_added - sqrt_one_minus_alphas_cumprod_t * x_batch
 
                 # --- Accumulator Step ---
                 # Pass data to accumulator (handles model forward, loss, backward)
-                loss_value_tensor = accumulator.train_step(x_t, t, noise_added)
+                loss_value_tensor = accumulator.train_step(x_t, t, target_v)
                 loss_value = loss_value_tensor.item() # Get Python float for logging/printing
                 epoch_losses.append(loss_value)
 
@@ -324,6 +323,65 @@ class DiffusionModelPyTorch:
         x_t_minus_1 = torch.clamp(x_t_minus_1, -1.0, 1.0)
 
         return x_t_minus_1
+    
+    @torch.no_grad() # Decorator to disable gradient calculation during inference
+    def p_sample_v_prediction(self, model, x_t, t_int):
+        """
+        Sample from the model at timestep t using v-prediction (PyTorch version).
+
+        Args:
+            model (nn.Module): The neural network model (predicts v_theta).
+            x_t (torch.Tensor): Current noisy image, shape [B, C, H, W].
+            t_int (int): Current timestep as an integer.
+
+        Returns:
+            torch.Tensor: Predicted less noisy image at timestep t-1.
+        """
+        model.eval() # Set model to evaluation mode
+        batch_size = x_t.shape[0]
+        device = x_t.device
+        # Create tensor for timestep t
+        t_tensor = torch.full((batch_size,), t_int, dtype=torch.long, device=device)
+
+        # --- Modification for v-prediction starts ---
+        # 1. Predict the velocity component v_theta
+        predicted_v = model(x_t, t_tensor) # Assuming model output is v_theta directly
+
+        # 2. Convert predicted v_theta to predicted noise epsilon_pred
+        # Need sqrt_alphas_cumprod_t and sqrt_one_minus_alphas_cumprod_t
+        # Use the _extract helper to get coefficients for the current timestep t_int
+        # Note: _extract expects a tensor t, so we use t_tensor
+        sqrt_alpha_prod_t = self._extract(self.sqrt_alphas_cumprod, t_tensor, x_t.shape)
+        sqrt_one_minus_alpha_prod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t_tensor, x_t.shape)
+
+        # epsilon_pred = sqrt(1 - alpha_bar_t) * x_t + sqrt(alpha_bar_t) * v_theta
+        predicted_noise = sqrt_one_minus_alpha_prod_t * x_t + sqrt_alpha_prod_t * predicted_v
+        # --- Modification for v-prediction ends ---
+
+        # Get other parameters for timestep t (mostly scalars for DDPM)
+        alpha_t = self.alphas[t_int].to(device)
+        # alpha_cumprod_t = self.alphas_cumprod[t_int].to(device) # Not directly needed below, but related
+        beta_t = self.betas[t_int].to(device)
+        # Use scalar coefficient directly from pre-calculated tensor for sqrt(1-alpha_bar_t)
+        sqrt_one_minus_alpha_cumprod_scalar_t = self.sqrt_one_minus_alphas_cumprod[t_int].to(device)
+        sqrt_recip_alpha_t = self.sqrt_recip_alphas[t_int].to(device)
+
+        # 3. Calculate the mean using the *original* DDPM formula, but with epsilon_pred
+        # Equation: 1/sqrt(alpha_t) * (x_t - beta_t / sqrt(1 - alpha_cumprod_t) * epsilon_pred)
+        coeff = beta_t / sqrt_one_minus_alpha_cumprod_scalar_t # Use scalar version here
+        mean_pred = sqrt_recip_alpha_t * (x_t - coeff * predicted_noise) # Use the derived predicted_noise
+
+        # 4. Add noise based on posterior variance (same as before)
+        posterior_variance_t = self.posterior_variance[t_int].to(device)
+
+        # Sample noise z ~ N(0, I) only if t > 0
+        noise = torch.randn_like(x_t) if t_int > 0 else torch.zeros_like(x_t)
+
+        # Calculate final sample x_{t-1}
+        x_t_minus_1 = mean_pred + torch.sqrt(posterior_variance_t) * noise
+        x_t_minus_1 = torch.clamp(x_t_minus_1, -1.0, 1.0) # Clamp to valid range
+
+        return x_t_minus_1
 
     @torch.no_grad() # Decorator for inference mode
     def generate_images(self, model, num_images=4):
@@ -352,6 +410,44 @@ class DiffusionModelPyTorch:
         # Convert from [-1, 1] range to [0, 1]
         generated_images = (x_t + 1.0) / 2.0
         generated_images = torch.clamp(generated_images, 0.0, 1.0)
+
+        print("Image generation complete.")
+        return generated_images
+    
+    @torch.no_grad() # Decorator for inference mode
+    def generate_images_v_prediction(self, front_model, back_model, num_images=1):
+        """
+        Generate images using the v-prediction diffusion model (PyTorch version).
+
+        Args:
+            model (nn.Module): The neural network model.
+            num_images (int): Number of images to generate.
+
+        Returns:
+            torch.Tensor: Generated images in [0, 1] range, shape [N, C, H, W].
+        """
+        front_model.eval() # Set model to evaluation mode
+        back_model.eval()
+        print(f"Generating {num_images} images on device {self.device}...")
+        # Start with pure noise on the correct device
+        x_t = torch.randn(
+            (num_images, self.img_channels, self.img_size, self.img_size),
+            device=self.device
+        )
+
+        # # Sample step by step, from t=T-1 down to t=0
+        for t in tqdm(range(self.timesteps - 1, 199, -1), desc="Generating Front"):
+            x_t = self.p_sample_v_prediction(front_model, x_t, t)
+        
+        x_t = x_t.to('cpu')
+        for t in tqdm(range(199, -1, -1), desc="Generating Back"):
+            x_t = self.p_sample_v_prediction(back_model, x_t, t)
+
+        # Convert from [-1, 1] range to [0, 1]
+        generated_images = (x_t + 1.0) / 2.0
+        generated_images = torch.clamp(generated_images, 0.0, 1.0)
+        generated_images = generated_images.squeeze(0)
+        generated_images = generated_images.permute(1, 2, 0).clamp(0, 1).cpu().numpy()
 
         print("Image generation complete.")
         return generated_images
@@ -433,7 +529,7 @@ class DiffusionModelPyTorch:
                     print(f"Unused keys: {incompatible_keys.unexpected_keys}")
             
             # Đảm bảo model ở đúng device
-            model.to(self.device)
+            # model.to(self.device)
             
             # In thông tin tổng quát
             print(f"Partial weights loaded from {model_path}")
@@ -474,13 +570,14 @@ class DiffusionModelPyTorch:
 
         # Reverse process
         reverse_images = []
-        x_t = torch.randn_like(x_0_batch) # Start with noise on the correct device
+        # x_t = torch.randn_like(x_0_batch) # Start with noise on the correct device
+        x_t = noisy_image_t # Start with the last noisy image from the forward process
         print("Visualizing reverse process...")
         timesteps_for_reverse_vis = step_indices.tolist()[::-1] # Reverse order for display matching
         current_vis_idx = 0
 
         for t_int in tqdm(range(self.timesteps - 1, -1, -1), desc="Reverse"):
-            x_t = self.p_sample(model, x_t, t_int)
+            x_t = self.p_sample_v_prediction(model, x_t, t_int)
             # Store image if the timestep matches one we want to visualize
             if current_vis_idx < len(timesteps_for_reverse_vis) and t_int == timesteps_for_reverse_vis[current_vis_idx]:
                 img_display = (x_t[0].to(self.device) + 1.0) / 2.0 # Convert [-1, 1] to [0, 1]
@@ -519,3 +616,105 @@ class DiffusionModelPyTorch:
         plt.savefig('diffusion_visualization_pytorch.png')
         print("Saved visualization to diffusion_visualization_pytorch.png")
         plt.show()
+
+# Assume the cosine_beta_schedule function exists somewhere if needed for reference,
+# but we will rely on the scheduler's internal implementation.
+
+# Import a suitable scheduler, DDIM is a good start, DPM++ is often faster
+from diffusers import DDIMScheduler
+class ImageGenerator:
+    def __init__(self, img_channels=3, img_size=32, device='cuda', num_train_timesteps=1000):
+        """
+        Initializes the Image Generator using a diffusers Scheduler.
+
+        Args:
+            img_channels (int): Number of image channels.
+            img_size (int): Image height/width.
+            device (str or torch.device): Device to run on.
+            num_train_timesteps (int): The number of diffusion steps used during training (e.g., 1000).
+            # Note: We don't need beta_start, beta_end when using named schedules like squaredcos_cap_v2
+        """
+        self.img_channels = img_channels
+        self.img_size = img_size
+        self.device = device
+        self.num_train_timesteps = num_train_timesteps
+        def cosine_beta_schedule(num_train_timesteps, s=0.008, dtype=torch.float32):
+            steps = num_train_timesteps + 1
+            x = torch.linspace(0, num_train_timesteps, steps, dtype=dtype)
+            alphas_cumprod = torch.cos(((x / num_train_timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            betas = 1. - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+            return torch.clip(betas, 0., 0.999) # Use PyTorch's clip
+
+        self.betas = cosine_beta_schedule(num_train_timesteps).to(self.device)
+
+        # --- 1. Initialize the Scheduler ---
+        # Choose a scheduler. DDIMScheduler is faster than DDPM.
+        # DPMSolverMultistepScheduler is often even faster.
+        self.scheduler = DDIMScheduler( # Or DPMSolverMultistepScheduler(...)
+            num_train_timesteps=self.num_train_timesteps,
+            trained_betas=self.betas,
+            prediction_type="v_prediction",        # <<< Specify that the model predicts velocity (v)
+            clip_sample=False,                 # Often recommended for better generation quality
+            set_alpha_to_one=False,
+            steps_offset=1,
+        )
+        # You can set a default number of inference steps here if you like
+        # self.scheduler.set_timesteps(50)
+
+        print(f"ImageGenerator initialized with {type(self.scheduler).__name__}, "
+              f"cosine schedule (squaredcos_cap_v2), "
+              f"and prediction_type='velocity'.")
+
+    @torch.no_grad()
+    def generate_images(self, model, num_images=1, num_inference_steps=50):
+        """
+        Generate images using the diffusion model with the configured scheduler.
+
+        Args:
+            model (nn.Module): The neural network model (trained with v-prediction).
+            num_images (int): Number of images to generate.
+            num_inference_steps (int): Number of steps for the sampler.
+
+        Returns:
+            torch.Tensor: Generated images in [0, 1] range, shape [N, C, H, W].
+        """
+        model.eval() # Set model to evaluation mode
+        print(f"Generating {num_images} images using {num_inference_steps} steps on device {self.device}...")
+
+        # Set the number of inference steps for the scheduler
+        self.scheduler.set_timesteps(num_inference_steps)
+
+        # Start with pure noise (initial sample x_T)
+        latents = torch.randn(
+            (num_images, self.img_channels, self.img_size, self.img_size),
+            device=self.device
+        )
+        # Scale initial noise if required by the specific scheduler (DDIM/DDPM usually need this)
+        # Check the scheduler's documentation or examples for init_noise_sigma
+        # Example scaling (might vary): latents = latents * self.scheduler.init_noise_sigma
+
+        # Sampling Loop using the scheduler
+        for t in tqdm(self.scheduler.timesteps, desc="Generating"):
+            t = t.unsqueeze(0).to(self.device) # Match batch size
+            # Prepare input for the model (e.g., scaling for noise schedule)
+            # Some schedulers might require scaling the input latents
+            # latent_model_input = self.scheduler.scale_model_input(latents, t) # If needed
+            latent_model_input = latents # Often sufficient
+
+            # Call Model to predict velocity v_theta
+            # The model was trained to output v, so its output is v_theta
+            model_output_v = model(latent_model_input, t)
+
+            # Call Scheduler Step
+            # Pass the model's velocity prediction (model_output_v)
+            # The scheduler internally handles the conversion (v -> epsilon or v -> x0)
+            # based on its prediction_type and the sampling algorithm (DDIM etc.)
+            latents = self.scheduler.step(model_output_v, t, latents).prev_sample
+
+        # Post-processing: Convert from [-1, 1] range to [0, 1]
+        generated_images = (latents + 1.0) / 2.0
+        generated_images = torch.clamp(generated_images, 0.0, 1.0)
+
+        print("Image generation complete.")
+        return generated_images

@@ -99,11 +99,11 @@ class UNet(nn.Module):
         self,
         in_channels=3,              # Input image channels (e.g., 4 if VAE latent)
         out_channels=3,             # Output channels (usually same as input)
-        base_dim=64,                # Base channel dimension
-        dim_mults=(1, 2, 4, 8),     # Channel multipliers for each resolution level
-        num_resnet_blocks=2,        # Number of ResNet blocks per level
+        base_dim=256,               # Base channel dimension
+        dim_mults=(1, 2, 4),        # Channel multipliers for each resolution level
+        num_resnet_blocks=3,        # Number of ResNet blocks per level
         context_dim=768,            # Dimension of CLIP context embeddings
-        attn_heads=4,               # Number of attention heads
+        attn_heads=8,               # Number of attention heads
         dropout=0.1
     ):
         super().__init__()
@@ -127,8 +127,8 @@ class UNet(nn.Module):
         self.init_conv = nn.Conv2d(in_channels, base_dim, kernel_size=3, padding=1)
 
         # --- UNet Layers ---
-        dims = [base_dim] + [base_dim * m for m in dim_mults] # e.g., [64, 64, 128, 256, 512]
-        in_out_dims = list(zip(dims[:-1], dims[1:])) # e.g., [(64, 64), (64, 128), (128, 256), (256, 512)]
+        dims = [base_dim] + [base_dim * m for m in dim_mults] # e.g., [256, 256, 512, 1024]
+        in_out_dims = list(zip(dims[:-1], dims[1:])) # e.g., [(256, 256), (256, 512), (512, 1024)]
         num_resolutions = len(in_out_dims)
 
         # Helper modules
@@ -160,14 +160,10 @@ class UNet(nn.Module):
             stage_modules.append(make_resnet_block(dim_in, dim_out, actual_time_emb_dim))
             for _ in range(num_resnet_blocks - 1):
                 stage_modules.append(make_resnet_block(dim_out, dim_out, actual_time_emb_dim))
-
-            # Add Attention blocks (e.g., at lower resolutions)
-            if dim_out in [dims[-2], dims[-3]]: # add attention at last 2 resolutions
-                 stage_modules.append(make_attn_block(dim_out, attn_heads, context_dim))
-
-            if dim_out == dims[-1]: # Add more attention at the highest resolution
-                stage_modules.append(make_attn_block(dim_out, attn_heads * 2, context_dim))
-                stage_modules.append(make_attn_block(dim_out, attn_heads * 2, context_dim))
+                if dim_out > base_dim: # Double attention heads
+                    stage_modules.append(make_attn_block(dim_out, attn_heads * 2, context_dim))
+                else:
+                    stage_modules.append(make_attn_block(dim_out, attn_heads, context_dim))
 
             # Add Downsample layer if not the last stage
             if not is_last:
@@ -179,14 +175,17 @@ class UNet(nn.Module):
 
         # -- Bottleneck --
         mid_dim = dims[-1]
-        self.mid_block1 = make_resnet_block(mid_dim, mid_dim, actual_time_emb_dim)
-        self.mid_attn1 = make_attn_block(mid_dim, attn_heads * 2, context_dim)
-        self.mid_attn2 = make_attn_block(mid_dim, attn_heads * 2, context_dim)
-        self.mid_block2 = make_resnet_block(mid_dim, mid_dim, actual_time_emb_dim)
+        self.bottleneck = nn.ModuleList([])
+        # self.bottleneck.append(make_resnet_block(mid_dim, mid_dim, actual_time_emb_dim))
+        self.bottleneck.append(make_resnet_block(mid_dim, mid_dim, actual_time_emb_dim))
+        self.bottleneck.append(make_attn_block(mid_dim, attn_heads * 2, context_dim))
+        self.bottleneck.append(make_attn_block(mid_dim, attn_heads * 2, context_dim))
+        self.bottleneck.append(make_resnet_block(mid_dim, mid_dim, actual_time_emb_dim))
+        # self.bottleneck.append(make_resnet_block(mid_dim, mid_dim, actual_time_emb_dim))
 
         # -- Decoder --
         self.ups = nn.ModuleList([])
-        # Reverse dimensions for decoder, e.g., [(256, 512), (128, 256), (64, 128), (64, 64)]
+        # Reverse dimensions for decoder, e.g., [(512, 1024), (256, 512), (256, 256)]
         for i, (dim_out, dim_in) in enumerate(reversed(in_out_dims)): # Careful: dim_in/out are reversed role here
             is_last = (i == num_resolutions - 1)
             stage_modules = nn.ModuleList([])
@@ -196,14 +195,10 @@ class UNet(nn.Module):
             stage_modules.append(make_resnet_block(dim_in + skip_channels, dim_in, actual_time_emb_dim))
             for _ in range(num_resnet_blocks - 1):
                 stage_modules.append(make_resnet_block(dim_in, dim_in, actual_time_emb_dim))
-
-            # Add Attention blocks
-            if dim_in in [dims[-2], dims[-3]]: # Match encoder attention placement
-                 stage_modules.append(make_attn_block(dim_in, attn_heads, context_dim))
-            
-            if dim_in == dims[-1]:  # Add more attention at the highest resolution
-                stage_modules.append(make_attn_block(dim_in, attn_heads * 2, context_dim))
-                stage_modules.append(make_attn_block(dim_in, attn_heads * 2, context_dim))
+                if dim_in > base_dim:
+                    stage_modules.append(make_attn_block(dim_in, attn_heads * 2, context_dim))
+                else:
+                    stage_modules.append(make_attn_block(dim_in, attn_heads, context_dim))
 
             # Add Upsample layer if not the last stage (output stage)
             if not is_last:
@@ -239,54 +234,34 @@ class UNet(nn.Module):
 
         # 3. Encoder Path
         skip_connections = []
-        for i, stage in enumerate(self.downs):
-            res_block1 = stage[0] 
-            res_blocks_rest = stage[1:self.num_resnet_blocks] # Indexing assumes fixed structure
-            attn_block1 = stage[self.num_resnet_blocks] if len(stage) > self.num_resnet_blocks + 1 else None # Check if attn exists
-            attn_block2 = stage[self.num_resnet_blocks + 1] if len(stage) > self.num_resnet_blocks + 2 else None
-            downsample = stage[-1]
-
-            x = res_block1(x, t_emb)
-            for res_block in res_blocks_rest:
-                 x = res_block(x, t_emb)
-            if attn_block1 is not None:
-                x = attn_block1(x, context)
-            if attn_block2 is not None:
-                x = attn_block2(x, context)
-
-            skip_connections.append(x) # Store output before downsampling
-            x = downsample(x)
+        for stage in self.downs:
+            for block in stage:
+                if isinstance(block, BasicTransformerBlock):
+                    x = block(x, context)
+                elif isinstance(block, ResidualBlock):
+                    x = block(x, t_emb)
+                else:
+                    skip_connections.append(x)
+                    x = block(x)
 
         # 4. Bottleneck
-        x = self.mid_block1(x, t_emb)
-        x = self.mid_attn1(x, context)
-        x = self.mid_attn2(x, context)
-        x = self.mid_block2(x, t_emb)
+        for block in self.bottleneck:
+            if isinstance(block, BasicTransformerBlock):
+                x = block(x, context)
+            elif isinstance(block, ResidualBlock):
+                x = block(x, t_emb)
 
         # 5. Decoder Path
         # Iterate through decoder stages and corresponding skip connections in reverse
-        for i, stage in enumerate(self.ups):
-            # Get skip connection from corresponding encoder level
-            skip = skip_connections.pop() # Pop from the end
-
-            res_block1 = stage[0]
-            res_blocks_rest = stage[1:self.num_resnet_blocks]
-            attn_block = stage[self.num_resnet_blocks] if len(stage) > self.num_resnet_blocks + 1 else None
-            attn_block2 = stage[self.num_resnet_blocks + 1] if len(stage) > self.num_resnet_blocks + 2 else None
-            upsample = stage[-1]
-
-            x = torch.cat((skip, x), dim=1) # Concatenate along channel dimension
-
-            x = res_block1(x, t_emb)
-            for res_block in res_blocks_rest:
-                x = res_block(x, t_emb)
-            if attn_block is not None:
-                x = attn_block(x, context)
-            if attn_block2 is not None:
-                x = attn_block2(x, context)
-            
-            x = upsample(x)
-
+        for skip, stage in zip(reversed(skip_connections), self.ups):
+            x = torch.cat([x, skip], dim=1)
+            for block in stage:
+                if isinstance(block, BasicTransformerBlock):
+                    x = block(x, context)
+                elif isinstance(block, ResidualBlock):
+                    x = block(x, t_emb)
+                else:
+                    x = block(x)
 
         # 6. Final Layers
         x = self.final_norm(x)
@@ -300,7 +275,6 @@ class UNet(nn.Module):
 # --- Example Usage ---
 # ------------------------------------------
 if __name__ == "__main__":
-    x = [1, 2, 3, 4]
     # --- Config ---
     img_size = 32 # Example image size (UNet input size, e.g., VAE latent size)
     in_channels = 4 # Example: Latent channels from VAE
@@ -308,7 +282,7 @@ if __name__ == "__main__":
     batch_size = 2
     clip_seq_len = 77
     time_steps = 1000
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device ="cpu"
 
     print(f"Using device: {device}")
 
@@ -332,20 +306,10 @@ if __name__ == "__main__":
     print("CLIP instantiated.")
 
     print("Instantiating UNet...")
-    unet_model = UNet(
-        in_channels=in_channels,
-        out_channels=out_channels,
-        base_dim=128,              # Example base dimension
-        dim_mults=(1, 2, 3, 4),    # Example multipliers
-        num_resnet_blocks=2,
-        context_dim=768,           # CLIP output dim
-        attn_heads=4,
-        dropout=0.1
-    ).to(device)
+    unet_model = UNet(in_channels=4, out_channels=4).to(device)
     print("UNet instantiated.")
     # Chỉ truyền input chính (hình ảnh) cho torchsummary
     print("Model Summary:")
-    print(unet_model)    
     # Thêm vào đoạn code trước khi chạy forward pass
     summary(
         unet_model, 
