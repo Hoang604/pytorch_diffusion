@@ -163,17 +163,25 @@ class DiffusionModelPyTorch:
 
         return x_t, noise
 
-    def train_with_accumulation(self, dataset, model, accumulator, optimizer, epochs=30, log_dir_base='/home/hoang/python/pytorch_diffusion', checkpoint_dir_base='/home/hoang/python/pytorch_diffusion'):
+    def train_with_accumulation(self, dataset, model, accumulator, optimizer, epochs=30, start_epoch=0, best_loss=float('inf'), log_dir=None, checkpoint_dir=None, log_dir_base='/home/hoang/python/pytorch_diffusion', checkpoint_dir_base='/home/hoang/python/pytorch_diffusion'):
         """
         Train with gradient accumulation in PyTorch.
         Assumes dataset yields batches of images (e.g., DataLoader).
         """
         model.to(self.device) # Ensure model is on the correct device
-
-        # Create directories for checkpoints and logs
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        log_dir = os.path.join(log_dir_base, 'logs', timestamp)
-        checkpoint_dir = os.path.join(checkpoint_dir_base, 'temp_checkpoints', timestamp)
+        
+
+        if log_dir is not None:
+            log_dir = log_dir
+        else:
+            log_dir = os.path.join(log_dir_base, 'logs', timestamp)
+
+        if checkpoint_dir is not None:
+            checkpoint_dir = checkpoint_dir
+        else:
+            checkpoint_dir = os.path.join(checkpoint_dir_base, 'temp_checkpoints', timestamp)
+
         best_checkpoint_path = os.path.join(checkpoint_dir, 'diffusion_model_best.pth')
         os.makedirs(log_dir, exist_ok=True)
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -181,15 +189,15 @@ class DiffusionModelPyTorch:
         # Set up TensorBoard writer
         writer = SummaryWriter(log_dir)
 
-        global_step = 0 # Counter for optimizer steps (after accumulation)
-        batch_step = 0  # Counter for individual batches processed
+        global_step = start_epoch * len(dataset) # Counter for optimizer steps (after accumulation)
+        batch_step = start_epoch * len(dataset)  # Counter for individual batches processed
         best_loss = float('inf')
 
         print(f"Starting training on device: {self.device}")
         print(f"Logging to: {log_dir}")
         print(f"Saving checkpoints to: {checkpoint_dir}")
 
-        for epoch in range(epochs):
+        for epoch in range(start_epoch, epochs):
             print(f"\nEpoch {epoch+1}/{epochs}")
             model.train() # Set model to training mode for the epoch
             progress_bar = tqdm(total=len(dataset), desc="Training")
@@ -223,7 +231,7 @@ class DiffusionModelPyTorch:
                 writer.add_scalar('Loss/batch', loss_value, batch_step)
 
                 # Log images periodically (less frequently than every batch usually)
-                if batch_step % 500 == 0:
+                if batch_step % 5000 == 0:
                      # Log original images (normalize [-1, 1] to [0, 1])
                     writer.add_images("Original Images", (x_batch.float() + 1) / 2, global_step=batch_step, dataformats='NCHW')
                      # Log noisy images (normalize [-1, 1] to [0, 1])
@@ -257,7 +265,7 @@ class DiffusionModelPyTorch:
             # Generate and log images periodically
             if (epoch + 1) % 5 == 0:
                 print("Generating images...")
-                generated = self.generate_images(model, num_images=4) # Use num_images=4 for grid
+                generated = self.generate_images_v_prediction(model, num_images=4) # Use num_images=4 for grid
                 writer.add_images("Generated Images", generated, global_step=epoch, dataformats='NCHW')
                 print("Generated images logged to TensorBoard.")
 
@@ -415,7 +423,7 @@ class DiffusionModelPyTorch:
         return generated_images
     
     @torch.no_grad() # Decorator for inference mode
-    def generate_images_v_prediction(self, front_model, back_model, num_images=1):
+    def generate_images_v_prediction(self, model, num_images=4):
         """
         Generate images using the v-prediction diffusion model (PyTorch version).
 
@@ -426,8 +434,7 @@ class DiffusionModelPyTorch:
         Returns:
             torch.Tensor: Generated images in [0, 1] range, shape [N, C, H, W].
         """
-        front_model.eval() # Set model to evaluation mode
-        back_model.eval()
+        model.eval() # Set model to evaluation mode
         print(f"Generating {num_images} images on device {self.device}...")
         # Start with pure noise on the correct device
         x_t = torch.randn(
@@ -436,18 +443,12 @@ class DiffusionModelPyTorch:
         )
 
         # # Sample step by step, from t=T-1 down to t=0
-        for t in tqdm(range(self.timesteps - 1, 199, -1), desc="Generating Front"):
-            x_t = self.p_sample_v_prediction(front_model, x_t, t)
-        
-        x_t = x_t.to('cpu')
-        for t in tqdm(range(199, -1, -1), desc="Generating Back"):
-            x_t = self.p_sample_v_prediction(back_model, x_t, t)
+        for t in tqdm(range(self.timesteps - 1, -1, -1), desc="Generating"):
+            x_t = self.p_sample_v_prediction(model, x_t, t)
 
         # Convert from [-1, 1] range to [0, 1]
         generated_images = (x_t + 1.0) / 2.0
         generated_images = torch.clamp(generated_images, 0.0, 1.0)
-        generated_images = generated_images.squeeze(0)
-        generated_images = generated_images.permute(1, 2, 0).clamp(0, 1).cpu().numpy()
 
         print("Image generation complete.")
         return generated_images
@@ -536,6 +537,108 @@ class DiffusionModelPyTorch:
             print(f"Successfully loaded {len(state_dict) - len(incompatible_keys.unexpected_keys)} compatible parameters")
         else:
             print(f"Warning: Model weights path not found: {model_path}")
+    
+    # Inside the DiffusionModelPyTorch class...
+
+    def load_checkpoint_for_resume(self, model, optimizer, checkpoint_path):
+        """
+        Load a full checkpoint for resuming training, performing loading
+        operations on the CPU to avoid GPU OOM, then moving the model
+        back to the target device (self.device).
+
+        Args:
+            model (nn.Module): The model instance (should ideally be on CPU initially).
+            optimizer (torch.optim.Optimizer): The optimizer instance.
+            checkpoint_path (str): Path to the checkpoint file (.pth).
+
+        Returns:
+            int: The epoch number to start training from (saved_epoch + 1).
+            float: The loss value saved in the checkpoint.
+                   Returns float('inf') if checkpoint doesn't exist/fails to load.
+        """
+        start_epoch = 0
+        loaded_loss = float('inf')
+        original_device = next(model.parameters()).device # Remember the model's original device (likely CPU if called correctly)
+
+        # Ensure model is on CPU before loading state dicts from a CPU-loaded checkpoint
+        model.to('cpu')
+        print(f"Temporarily moved model to CPU for loading.")
+
+
+        # Check if the checkpoint file exists
+        if os.path.isfile(checkpoint_path):
+            print(f"Loading checkpoint for resume from: {checkpoint_path} onto CPU")
+            try:
+                # --- Step 1: Load the entire checkpoint dictionary onto CPU ---
+                checkpoint = torch.load(
+                    checkpoint_path,
+                    map_location='cpu', # <<< Load all tensors in the checkpoint to CPU memory
+                    weights_only=False   # <<< Keep this False to load optimizer state etc.
+                )
+                print("Checkpoint dictionary loaded to CPU memory.")
+
+                # --- Step 2: Load model state dict while model is on CPU ---
+                model.load_state_dict(checkpoint['model_state_dict'])
+                print("Model state loaded successfully onto CPU model.")
+
+                # --- Step 3: Load optimizer state dict ---
+                # The optimizer state is associated with model parameters.
+                # Since the model is currently on CPU, loading the optimizer state
+                # (which was also loaded to CPU by map_location='cpu') works here.
+                if 'optimizer_state_dict' in checkpoint and optimizer is not None:
+                    try:
+                        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                        print("Optimizer state loaded successfully (references CPU parameters for now).")
+                    except Exception as optim_load_err:
+                         print(f"Error loading optimizer state: {optim_load_err}")
+                         # Decide if you want to proceed without optimizer state or re-raise
+                         print("Warning: Optimizer state loading failed. Optimizer will start from scratch.")
+                elif optimizer is None:
+                     print("Warning: Optimizer not provided, skipping optimizer state loading.")
+                else:
+                    print("Warning: Optimizer state not found in checkpoint. Optimizer starts from scratch.")
+
+                # --- Step 4: Load epoch and loss (these are usually small scalars) ---
+                if 'epoch' in checkpoint:
+                    saved_epoch = checkpoint['epoch']
+                    start_epoch = saved_epoch + 1
+                    print(f"Resuming from epoch: {start_epoch}")
+                else:
+                    print("Warning: Epoch number not found in checkpoint. Starting from epoch 0.")
+
+                if 'loss' in checkpoint:
+                    loaded_loss = checkpoint['loss']
+                    print(f"Loaded loss from checkpoint: {loaded_loss:.6f}")
+                else:
+                     print("Info: Loss value not found in checkpoint.")
+
+                # --- Step 5: Move the model back to the target device (e.g., CUDA) ---
+                # This needs to happen AFTER successfully loading state dicts.
+                model.to(self.device)
+                print(f"Model moved back to target device: {self.device}")
+                # NOTE: The optimizer's state (buffers) will implicitly move with the
+                # parameters when the model is moved. No explicit optimizer.to(self.device) is usually needed.
+
+            except Exception as e:
+                print(f"Error loading checkpoint: {e}")
+                print("Starting training from scratch due to error during loading.")
+                # Attempt to move model back to original device even if loading failed
+                try:
+                     model.to(self.device)
+                     print(f"Model moved back to target device '{self.device}' after loading error.")
+                except Exception as move_err:
+                     print(f"Could not move model back to target device after error: {move_err}")
+                start_epoch = 0
+                loaded_loss = float('inf')
+        else:
+            print(f"Checkpoint file not found at {checkpoint_path}. Starting training from scratch.")
+            # Ensure model is on the correct device if starting from scratch
+            model.to(self.device)
+            print(f"Model ensured to be on target device '{self.device}' when starting fresh.")
+            start_epoch = 0
+            loaded_loss = float('inf')
+
+        return start_epoch, loaded_loss
 
     @torch.no_grad()
     def visualize_diffusion_steps(self, model, x_0_tensor, num_steps_to_show=10):

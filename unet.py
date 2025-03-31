@@ -151,7 +151,7 @@ class UNet(nn.Module):
             )
 
 
-        # -- Encoder --
+        # -- Encoder -- 1 attention each block
         self.downs = nn.ModuleList([])
         for i, (dim_in, dim_out) in enumerate(in_out_dims):
             is_last = (i == num_resolutions - 1)
@@ -160,10 +160,10 @@ class UNet(nn.Module):
             stage_modules.append(make_resnet_block(dim_in, dim_out, actual_time_emb_dim))
             for _ in range(num_resnet_blocks - 1):
                 stage_modules.append(make_resnet_block(dim_out, dim_out, actual_time_emb_dim))
-                if dim_out > base_dim: # Double attention heads
-                    stage_modules.append(make_attn_block(dim_out, attn_heads * 2, context_dim))
-                else:
-                    stage_modules.append(make_attn_block(dim_out, attn_heads, context_dim))
+            if dim_out > base_dim: # Double attention heads
+                stage_modules.append(make_attn_block(dim_out, attn_heads * 2, context_dim))
+            else:
+                stage_modules.append(make_attn_block(dim_out, attn_heads, context_dim))
 
             # Add Downsample layer if not the last stage
             if not is_last:
@@ -183,7 +183,7 @@ class UNet(nn.Module):
         self.bottleneck.append(make_resnet_block(mid_dim, mid_dim, actual_time_emb_dim))
         # self.bottleneck.append(make_resnet_block(mid_dim, mid_dim, actual_time_emb_dim))
 
-        # -- Decoder --
+        # -- Decoder -- 3 attention per block
         self.ups = nn.ModuleList([])
         # Reverse dimensions for decoder, e.g., [(512, 1024), (256, 512), (256, 256)]
         for i, (dim_out, dim_in) in enumerate(reversed(in_out_dims)): # Careful: dim_in/out are reversed role here
@@ -199,6 +199,11 @@ class UNet(nn.Module):
                     stage_modules.append(make_attn_block(dim_in, attn_heads * 2, context_dim))
                 else:
                     stage_modules.append(make_attn_block(dim_in, attn_heads, context_dim))
+            
+            if dim_in > base_dim:
+                stage_modules.append(make_attn_block(dim_in, attn_heads * 2, context_dim))
+            else:
+                stage_modules.append(make_attn_block(dim_in, attn_heads, context_dim))
 
             # Add Upsample layer if not the last stage (output stage)
             if not is_last:

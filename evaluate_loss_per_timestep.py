@@ -438,6 +438,12 @@ def main(args):
             if args.show_plot:
                 print("Displaying plot...") # write message on console
                 plt.show() # Display the plot
+                # save image
+                plot_filename = 'grouped_loss_vs_timestep_plot.png'
+                plot_path = os.path.join(args.output_dir, plot_filename)
+                plt.savefig(plot_path)
+                print(f"Saved plot to: {plot_path}")
+                
 
             plt.close() # Close the figure window after saving/showing
 

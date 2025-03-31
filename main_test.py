@@ -120,11 +120,6 @@ def main(args):
 
     print("Initializing model with random weights")
 
-    if os.path.exists(args.weights_path):
-        diffusion_helper.load_model_weights(unet_model, args.weights_path, verbose=args.verbose)
-        print(f"Loaded model weights from {args.weights_path}") # write message on console
-        
-
     optimizer = bnb.optim.AdamW8bit(
         unet_model.parameters(),
         lr=args.learning_rate,
@@ -140,22 +135,30 @@ def main(args):
     )
     print(f"Gradient Accumulation Steps: {args.accumulation_steps}") # write message on console
 
+    if os.path.exists(args.weights_path):
+        start_epoch, best_loss = diffusion_helper.load_checkpoint_for_resume(unet_model, optimizer=optimizer, checkpoint_path=args.weights_path)
+        print(f"Loaded model weights from {args.weights_path}") # write message on console
+        
     def visualize_diffusion():
         print("Generating sample images...")
         image_generator = ImageGenerator()
         images = []
-        for i in range(5):
+        for i in range(15):
             images.append(image_generator.generate_images(unet_model).squeeze(0))
             print(images[i].shape)
 
         import matplotlib.pyplot as plt
-        x = plt.subplots(1, 5, figsize=(5, 1))
-        for i in range(5):
-            plt.subplot(1, 5, i+1)
+        x = plt.subplots(1, 15, figsize=(15, 1))
+        for i in range(15):
+            plt.subplot(1, 15, i+1)
             plt.imshow(images[i].permute(1, 2, 0).detach().cpu().numpy())
             plt.axis('off')
         plt.show()
     
+    visualize_diffusion()
+
+    diffusion_helper.visualize_diffusion_steps(unet_model, train_dataset[0])
+    input("Press Enter to continue...")
 
     # --- Start Training ---
     print("\nStarting training process...") # write message on console
@@ -166,15 +169,18 @@ def main(args):
             accumulator=accumulator,
             optimizer=optimizer,
             epochs=args.epochs,
+            start_epoch=start_epoch,
+            best_loss=best_loss,
             log_dir_base=args.log_dir,
-            checkpoint_dir_base=args.checkpoint_dir,
-            train_first = True
+            log_dir='/home/hoang/python/pytorch_diffusion/logs/20250329-142504',
+            checkpoint_dir='/home/hoang/python/pytorch_diffusion/temp_checkpoints/20250329-142504',
+            checkpoint_dir_base=args.checkpoint_dir
         )
     except Exception as train_e:
         # Catch potential errors during training (e.g., from DataLoader if __getitem__ fails)
         # write error message on console
         print(f"\nERROR occurred during training: {train_e}")
-        print("This might be due to issues reading image files or shape mismatches.")
+        print("This might be due to issues reading image files or shape mismatches.") 
 
 # --- Script Entry Point ---
 if __name__ == "__main__": 
@@ -192,7 +198,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader worker processes')
     # Diffusion args
     parser.add_argument('--timesteps', type=int, default=1000, help='Number of diffusion timesteps')
-    parser.add_argument('--weights_path', type=str, default="/home/hoang/python/pytorch_diffusion/temp_checkpoints/20250328-132908/diffusion_model_best.pth", help='Path to pre-trained model weights')
+    parser.add_argument('--weights_path', type=str, default="/home/hoang/python/pytorch_diffusion/temp_checkpoints/20250329-142504/diffusion_model_best.pth", help='Path to pre-trained model weights')
     # UNet args
     parser.add_argument('--unet_base_dim', type=int, default=256, help='Base channel dimension for UNet')
     parser.add_argument('--unet_dim_mults', type=int, nargs='+', default=[1, 2, 4], help='Channel multipliers for UNet')
