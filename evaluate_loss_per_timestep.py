@@ -106,8 +106,8 @@ class SimpleImageDataset(Dataset):
 
 # --- Import required classes from project ---
 try:
-    from unet_test import UNet
-    from diffusion_test import DiffusionModelPyTorch
+    from unet import UNet
+    from diffusion import DiffusionModelPyTorch
 except ImportError as e:
     print(f"Error: Could not import required modules (UNet, DiffusionModelPyTorch).") # write error message on console
     print(f"Ensure unet_test.py and diffusion_test.py are accessible.") # write error message on console

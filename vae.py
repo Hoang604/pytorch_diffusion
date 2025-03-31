@@ -10,18 +10,21 @@ class VAEEncoder(nn.Module):
 
         self.conv_in = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1)
 
-        self.resnet_block_in = self._make_layer(ResidualBlock, 64, 64, num_resnet_blocks, stride=1)
-        self.resnet_block_1 = self._make_layer(ResidualBlock, 64, 128, num_resnet_blocks, stride=2)
-        self.resnet_block_2 = self._make_layer(ResidualBlock, 128, 256, num_resnet_blocks, stride=2)
-        self.resnet_block_3 = self._make_layer(ResidualBlock, 256, 512, num_resnet_blocks, stride=2)
+        self.resnet_block_in = self._make_layer(ResidualBlock, 64, 64, num_resnet_blocks)
+        self.downsample_1 = nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1)
+        self.resnet_block_1 = self._make_layer(ResidualBlock, 64, 128, num_resnet_blocks)
+        self.downsample_2 = nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1)
+        self.resnet_block_2 = self._make_layer(ResidualBlock, 128, 256, num_resnet_blocks)
+        self.downsample_3 = nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1)
+        self.resnet_block_3 = self._make_layer(ResidualBlock, 256, 512, num_resnet_blocks)
 
         self.attention1 = MultiHeadAttentionBlock(512, num_attention_heads)
 
         self.conv_out = nn.Conv2d(512, 2 * latent_dim, kernel_size=3, padding=1)
 
-    def _make_layer(self, block, in_channels, out_channels, num_blocks, stride=1):
+    def _make_layer(self, block, in_channels, out_channels, num_blocks):
         layers = []
-        layers.append(block(in_channels, out_channels, stride))
+        layers.append(block(in_channels, out_channels))
         for _ in range(1, num_blocks):
             layers.append(block(out_channels, out_channels))
         return nn.Sequential(*layers)
@@ -38,10 +41,13 @@ class VAEEncoder(nn.Module):
         # (batch_size, 64, height, width) -> (batch_size, 64, height, width)
         x = self.resnet_block_in(x)
         # (batch_size, 64, height, width) -> (batch_size, 512, height / 2, width / 2)
+        x = self.downsample_1(x)
         x = self.resnet_block_1(x)
         # (batch_size, 512, height / 2, width / 2) -> (batch_size, 512, height / 4, width / 4))
+        x = self.downsample_2(x)
         x = self.resnet_block_2(x)
         # (batch_size, 512, height / 4, width / 4) -> (batch_size, 512, height / 8, width / 8)
+        x = self.downsample_3(x)
         x = self.resnet_block_3(x)
 
         # (batch_size, 512, height / 8, width / 8) -> (batch_size, 512, height / 8, width / 8)
@@ -63,14 +69,14 @@ class VAEDecoder(nn.Module):
         self.attention = MultiHeadAttentionBlock(512, num_attention_heads)
 
         # 4 upsample blocks, suppose the input size is 256x256
-        self.upsample1 = self._make_upsample_block(512)  # 32x32 → 64x64
         self.resnet_block_1 = self._make_layer(ResidualBlock, 512, 256, num_resnet_block)
+        self.upsample1 = self._make_upsample_block(256)  # 32x32 → 64x64
 
-        self.upsample2 = self._make_upsample_block(256)  # 64x64 → 128x128
         self.resnet_block_2 = self._make_layer(ResidualBlock, 256, 128, num_resnet_block)
+        self.upsample2 = self._make_upsample_block(128)  # 64x64 → 128x128
 
-        self.upsample3 = self._make_upsample_block(128)  # 128x128 → 256x256
         self.resnet_block_3 = self._make_layer(ResidualBlock, 128, 64, num_resnet_block)
+        self.upsample3 = self._make_upsample_block(64)  # 128x128 → 256x256
 
         self.resnet_block_4 = self._make_layer(ResidualBlock, 64, 64, num_resnet_block - 1)
 
@@ -84,9 +90,9 @@ class VAEDecoder(nn.Module):
             nn.SiLU()
         )
 
-    def _make_layer(self, block, in_channels, out_channels, num_blocks, stride=1):
+    def _make_layer(self, block, in_channels, out_channels, num_blocks):
         layers = []
-        layers.append(block(in_channels, out_channels, stride))
+        layers.append(block(in_channels, out_channels))
         for _ in range(1, num_blocks):
             layers.append(block(out_channels, out_channels))
         return nn.Sequential(*layers)
@@ -105,16 +111,16 @@ class VAEDecoder(nn.Module):
         x = self.attention(x)  # [batch, 512, h/8, w/8]
 
         # --- Block 1: 32x32 -> 64x64 ---
-        x = self.upsample1(x)  # [batch, 512, h/4, w/4] (PixelShuffle keep number of channels)
-        x = self.resnet_block_1(x)  # [batch, 256, h/4, w/4] (ResNet reduce channels from 512->256)
+        x = self.resnet_block_1(x)  # [batch, 256, h/8, w/8] (ResNet reduce channels from 512->256)
+        x = self.upsample1(x)  # [batch, 256, h/4, w/4] (PixelShuffle keep number of channels)
 
         # --- Block 2: 64x64 -> 128x128 ---
-        x = self.upsample2(x)  # [batch, 256, h/2, w/2]
-        x = self.resnet_block_2(x)  # [batch, 128, h/2, w/2]
+        x = self.resnet_block_2(x)  # [batch, 128, h/4, w/4]
+        x = self.upsample2(x)  # [batch, 128, h/2, w/2]
 
         # --- Block 3: 128x128 -> 256x256 ---
-        x = self.upsample3(x)  # [batch, 128, h, w]
-        x = self.resnet_block_3(x)  # [batch, 64, h, w]
+        x = self.resnet_block_3(x)  # [batch, 64, h/2, w/2]
+        x = self.upsample3(x)  # [batch, 64, h, w]
 
         # --- Block 4: 256x256 -> 256x256 ---
         x = self.resnet_block_4(x)  # [batch, 64, h, w]
@@ -141,7 +147,7 @@ class VAE(nn.Module):
         """Decode latent vector to reconstruction"""
         return self.decoder(z)
 
-    def reparameterize(self, mean, var, noise):
+    def reparameterize(self, mean, var, noise=None):
         """Sample from the latent distribution using the reparameterization trick"""
         std = torch.sqrt(var)
         if noise:

@@ -163,7 +163,7 @@ class DiffusionModelPyTorch:
 
         return x_t, noise
 
-    def train_with_accumulation(self, dataset, model, accumulator, optimizer, epochs=30, start_epoch=0, best_loss=float('inf'), log_dir=None, checkpoint_dir=None, log_dir_base='/home/hoang/python/pytorch_diffusion', checkpoint_dir_base='/home/hoang/python/pytorch_diffusion'):
+    def train_with_accumulation(self, dataset, vae, model, accumulator, optimizer, epochs=30, start_epoch=0, best_loss=float('inf'), log_dir=None, checkpoint_dir=None, log_dir_base='/home/hoang/python/pytorch_diffusion', checkpoint_dir_base='/home/hoang/python/pytorch_diffusion'):
         """
         Train with gradient accumulation in PyTorch.
         Assumes dataset yields batches of images (e.g., DataLoader).
@@ -203,39 +203,34 @@ class DiffusionModelPyTorch:
             progress_bar = tqdm(total=len(dataset), desc="Training")
             epoch_losses = []
 
-            for batch_idx, x_batch in enumerate(dataset):
+            for _, x_batch in enumerate(dataset):
                 # --- Data Loading ---
                 # Assume dataset provides image tensors directly
                 # Move initial batch data to device if not already done by DataLoader
                 x_batch = x_batch.to(self.device)
-                actual_batch_size = x_batch.shape[0]
+                mean, _ = vae.encode(x_batch)
+                latent = mean * 0.18215
+                actual_batch_size = latent.shape[0]
 
                 # --- Timestep Sampling ---
                 # Sample random timesteps CORRECTLY
                 t = torch.randint(0, self.timesteps, (actual_batch_size,), device=self.device, dtype=torch.long)
                 # --- Forward Diffusion ---
-                x_t, noise_added = self.q_sample(x_batch, t)
-                sqrt_alphas_cumprod_t = self._extract(self.sqrt_alphas_cumprod, t, x_t.shape)
-                sqrt_one_minus_alphas_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
+                latent_t, noise_added = self.q_sample(latent, t)
+                sqrt_alphas_cumprod_t = self._extract(self.sqrt_alphas_cumprod, t, latent_t.shape)
+                sqrt_one_minus_alphas_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, latent_t.shape)
 
                 # v = sqrt(alpha_bar_t) * epsilon - sqrt(1 - alpha_bar_t) * x_0
-                target_v = sqrt_alphas_cumprod_t * noise_added - sqrt_one_minus_alphas_cumprod_t * x_batch
+                target_v = sqrt_alphas_cumprod_t * noise_added - sqrt_one_minus_alphas_cumprod_t * latent
 
                 # --- Accumulator Step ---
                 # Pass data to accumulator (handles model forward, loss, backward)
-                loss_value_tensor = accumulator.train_step(x_t, t, target_v)
+                loss_value_tensor = accumulator.train_step(latent_t, t, target_v)
                 loss_value = loss_value_tensor.item() # Get Python float for logging/printing
                 epoch_losses.append(loss_value)
 
                 # --- Logging (per batch) ---
                 writer.add_scalar('Loss/batch', loss_value, batch_step)
-
-                # Log images periodically (less frequently than every batch usually)
-                if batch_step % 5000 == 0:
-                     # Log original images (normalize [-1, 1] to [0, 1])
-                    writer.add_images("Original Images", (x_batch.float() + 1) / 2, global_step=batch_step, dataformats='NCHW')
-                     # Log noisy images (normalize [-1, 1] to [0, 1])
-                    writer.add_images("Noisy Images", (x_t + 1.0) / 2.0, global_step=batch_step, dataformats='NCHW')
 
                 # --- Update Counters and Progress Bar ---
                 batch_step += 1
@@ -308,8 +303,6 @@ class DiffusionModelPyTorch:
         predicted_noise = model(x_t, t_tensor)
 
         # Get parameters for timestep t using tensor indexing
-        alpha_t = self.alphas[t_int] # scalar
-        alpha_cumprod_t = self.alphas_cumprod[t_int] # scalar
         beta_t = self.betas[t_int] # scalar
         sqrt_one_minus_alpha_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t_int] # scalar
         sqrt_recip_alpha_t = self.sqrt_recip_alphas[t_int] # scalar
@@ -390,68 +383,6 @@ class DiffusionModelPyTorch:
         x_t_minus_1 = torch.clamp(x_t_minus_1, -1.0, 1.0) # Clamp to valid range
 
         return x_t_minus_1
-
-    @torch.no_grad() # Decorator for inference mode
-    def generate_images(self, model, num_images=4):
-        """
-        Generate images using the diffusion model (PyTorch version).
-
-        Args:
-            model (nn.Module): The neural network model.
-            num_images (int): Number of images to generate.
-
-        Returns:
-            torch.Tensor: Generated images in [0, 1] range, shape [N, C, H, W].
-        """
-        model.eval() # Set model to evaluation mode
-        print(f"Generating {num_images} images on device {self.device}...")
-        # Start with pure noise on the correct device
-        x_t = torch.randn(
-            (num_images, self.img_channels, self.img_size, self.img_size),
-            device=self.device
-        )
-
-        # Sample step by step, from t=T-1 down to t=0
-        for t in tqdm(range(self.timesteps - 1, -1, -1), desc="Generating"):
-            x_t = self.p_sample(model, x_t, t)
-
-        # Convert from [-1, 1] range to [0, 1]
-        generated_images = (x_t + 1.0) / 2.0
-        generated_images = torch.clamp(generated_images, 0.0, 1.0)
-
-        print("Image generation complete.")
-        return generated_images
-    
-    @torch.no_grad() # Decorator for inference mode
-    def generate_images_v_prediction(self, model, num_images=4):
-        """
-        Generate images using the v-prediction diffusion model (PyTorch version).
-
-        Args:
-            model (nn.Module): The neural network model.
-            num_images (int): Number of images to generate.
-
-        Returns:
-            torch.Tensor: Generated images in [0, 1] range, shape [N, C, H, W].
-        """
-        model.eval() # Set model to evaluation mode
-        print(f"Generating {num_images} images on device {self.device}...")
-        # Start with pure noise on the correct device
-        x_t = torch.randn(
-            (num_images, self.img_channels, self.img_size, self.img_size),
-            device=self.device
-        )
-
-        # # Sample step by step, from t=T-1 down to t=0
-        for t in tqdm(range(self.timesteps - 1, -1, -1), desc="Generating"):
-            x_t = self.p_sample_v_prediction(model, x_t, t)
-
-        # Convert from [-1, 1] range to [0, 1]
-        generated_images = (x_t + 1.0) / 2.0
-        generated_images = torch.clamp(generated_images, 0.0, 1.0)
-
-        print("Image generation complete.")
-        return generated_images
 
     def save_model(self, model, save_path, optimizer=None, epoch=None, loss=None, save_weights_only=False):
         """
@@ -540,13 +471,15 @@ class DiffusionModelPyTorch:
     
     # Inside the DiffusionModelPyTorch class...
 
-    def load_checkpoint_for_resume(self, model, optimizer, checkpoint_path):
+    @staticmethod
+    def load_checkpoint_for_resume(device, model, optimizer, checkpoint_path):
         """
         Load a full checkpoint for resuming training, performing loading
         operations on the CPU to avoid GPU OOM, then moving the model
-        back to the target device (self.device).
+        back to the target device (device).
 
         Args:
+            device (str or torch.device): The target device for the model.
             model (nn.Module): The model instance (should ideally be on CPU initially).
             optimizer (torch.optim.Optimizer): The optimizer instance.
             checkpoint_path (str): Path to the checkpoint file (.pth).
@@ -614,8 +547,8 @@ class DiffusionModelPyTorch:
 
                 # --- Step 5: Move the model back to the target device (e.g., CUDA) ---
                 # This needs to happen AFTER successfully loading state dicts.
-                model.to(self.device)
-                print(f"Model moved back to target device: {self.device}")
+                model.to(device)
+                print(f"Model moved back to target device: {device}")
                 # NOTE: The optimizer's state (buffers) will implicitly move with the
                 # parameters when the model is moved. No explicit optimizer.to(self.device) is usually needed.
 
@@ -624,8 +557,8 @@ class DiffusionModelPyTorch:
                 print("Starting training from scratch due to error during loading.")
                 # Attempt to move model back to original device even if loading failed
                 try:
-                     model.to(self.device)
-                     print(f"Model moved back to target device '{self.device}' after loading error.")
+                     model.to(device)
+                     print(f"Model moved back to target device '{device}' after loading error.")
                 except Exception as move_err:
                      print(f"Could not move model back to target device after error: {move_err}")
                 start_epoch = 0
@@ -633,95 +566,12 @@ class DiffusionModelPyTorch:
         else:
             print(f"Checkpoint file not found at {checkpoint_path}. Starting training from scratch.")
             # Ensure model is on the correct device if starting from scratch
-            model.to(self.device)
-            print(f"Model ensured to be on target device '{self.device}' when starting fresh.")
+            model.to(device)
+            print(f"Model ensured to be on target device '{device}' when starting fresh.")
             start_epoch = 0
             loaded_loss = float('inf')
 
         return start_epoch, loaded_loss
-
-    @torch.no_grad()
-    def visualize_diffusion_steps(self, model, x_0_tensor, num_steps_to_show=10):
-        """
-        Visualize the diffusion process (PyTorch version).
-
-        Args:
-            model (nn.Module): The neural network model.
-            x_0_tensor (torch.Tensor): Original clean image tensor ([C, H, W], range [0, 255]).
-            num_steps_to_show (int): Number of intermediate steps to display.
-        """
-        model.eval()
-        if x_0_tensor.dim() == 3:
-             x_0_batch = x_0_tensor.unsqueeze(0).to(self.device) # Add batch dim, move to device
-        elif x_0_tensor.dim() == 4:
-             x_0_batch = x_0_tensor.to(self.device) # Assume already has batch dim
-        else:
-             raise ValueError("Input tensor x_0_tensor must have 3 or 4 dimensions")
-
-        # Select timesteps
-        step_indices = torch.linspace(0, self.timesteps - 1, num_steps_to_show, dtype=torch.long, device='cuda') # Use cuda for indices
-
-        # Forward process
-        forward_images = []
-        print("Visualizing forward process...")
-        for t_int in step_indices.tolist():
-            t = torch.tensor([t_int], device=self.device) # Create tensor for timestep
-            noisy_image_t, _ = self.q_sample(x_0_batch, t) # Use q_sample
-            # Convert [-1, 1] to [0, 1] for display, move to cuda, remove batch dim
-            img_display = (noisy_image_t[0].to(self.device) + 1.0) / 2.0
-            forward_images.append(img_display.permute(1, 2, 0).clamp(0, 1).cpu().numpy()) # CHW to HWC
-
-        # Reverse process
-        reverse_images = []
-        # x_t = torch.randn_like(x_0_batch) # Start with noise on the correct device
-        x_t = noisy_image_t # Start with the last noisy image from the forward process
-        print("Visualizing reverse process...")
-        timesteps_for_reverse_vis = step_indices.tolist()[::-1] # Reverse order for display matching
-        current_vis_idx = 0
-
-        for t_int in tqdm(range(self.timesteps - 1, -1, -1), desc="Reverse"):
-            x_t = self.p_sample_v_prediction(model, x_t, t_int)
-            # Store image if the timestep matches one we want to visualize
-            if current_vis_idx < len(timesteps_for_reverse_vis) and t_int == timesteps_for_reverse_vis[current_vis_idx]:
-                img_display = (x_t[0].to(self.device) + 1.0) / 2.0 # Convert [-1, 1] to [0, 1]
-                reverse_images.append(img_display.permute(1, 2, 0).clamp(0, 1).cpu().numpy()) # CHW to HWC
-                current_vis_idx += 1
-
-        # Reverse the collected reverse images to show T -> 0 order
-        reverse_images = reverse_images[::-1]
-
-        # Plotting (similar to TF version)
-        num_forward = len(forward_images)
-        num_reverse = len(reverse_images)
-        total_plots = num_forward + num_reverse
-        if total_plots == 0:
-             print("No images generated for visualization.")
-             return
-
-        plt.figure(figsize=(total_plots * 2, 4))
-
-        # Plot forward
-        for i, img in enumerate(forward_images):
-            ax = plt.subplot(2, max(num_forward, num_reverse), i + 1)
-            ax.imshow(img)
-            ax.set_title(f"Forward t={step_indices[i].item()}")
-            ax.axis('off')
-
-        # Plot reverse
-        for i, img in enumerate(reverse_images):
-            ax = plt.subplot(2, max(num_forward, num_reverse), i + max(num_forward, num_reverse) + 1)
-            ax.imshow(img)
-            # Titles correspond to the step index list in reverse order
-            ax.set_title(f"Reverse t={step_indices[num_reverse-1-i].item()}")
-            ax.axis('off')
-
-        plt.tight_layout()
-        plt.savefig('diffusion_visualization_pytorch.png')
-        print("Saved visualization to diffusion_visualization_pytorch.png")
-        plt.show()
-
-# Assume the cosine_beta_schedule function exists somewhere if needed for reference,
-# but we will rely on the scheduler's internal implementation.
 
 # Import a suitable scheduler, DDIM is a good start, DPM++ is often faster
 from diffusers import DDIMScheduler

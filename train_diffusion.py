@@ -1,18 +1,15 @@
-# main_train_minimal_dataset.py
 import torch
-import torchvision.transforms.functional as TF
-# Import Dataset from torch.utils.data
-from torch.utils.data import DataLoader, Dataset
-import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+from util import SimpleImageDataset
 import os
 import bitsandbytes as bnb
 import argparse
-# Import PIL.Image for loading images
-from PIL import Image
 from unet import UNet
 from diffusion import DiffusionModelPyTorch, GradientAccumulatorPyTorch, ImageGenerator
+from vae import VAE
 
-def main(args):
+            
+def train_diffusion(args):
     """
     Main function to set up and run the diffusion model training.
     Uses a hardcoded path for the dataset image folder and the simplified Dataset class.
@@ -22,71 +19,29 @@ def main(args):
     print(f"Using device: {device}") # write message on console
 
 
-    # Simple dataset for loading images from a folder
-    class SimpleImageDataset(Dataset):
-        def __init__(self, folder_path, img_size):
-            """
-            Initializes the dataset. Now includes logic to handle flipped images.
+    # --- Load Pre-trained VAE ---
+    print("Loading pre-trained VAE model...") # write message on console
+    vae = VAE(latent_dim=args.latent_dim).to(device)
+    try:
+        checkpoint = torch.load(args.vae_weights_path, map_location=device)
+        # Adjust loading based on how checkpoint was saved in train_vae.py
+        if 'model_state_dict' in checkpoint:
+            vae.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            vae.load_state_dict(checkpoint) # Assume raw state dict was saved
+        print(f"Loaded VAE weights from {args.vae_weights_path}") # write message on console
+    except FileNotFoundError:
+        print(f"Error: VAE weights file not found at {args.vae_weights_path}. Please train VAE first.") # write error message on console
+        return
+    except Exception as e:
+        print(f"Error loading VAE weights: {e}") # write error message on console
+        return
 
-            Args:
-                folder_path (str): Path to the folder containing images.
-                img_size (int): Target size for the images (height and width).
-            """
-            self.folder_path = folder_path
-            # Find image files - consider adding more extensions if needed
-            self.image_files = sorted([f for f in os.listdir(folder_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
-            self.original_len = len(self.image_files) # Store original number of files
-
-            # Define the main transformations (excluding the flip)
-            self.transform = transforms.Compose([
-                transforms.Resize((img_size, img_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-            ])
-            print(f"Found {self.original_len} images in {folder_path}.") # write message on console
-
-        def __len__(self):
-            """ Returns the total size of the dataset (original + flipped). """
-            return self.original_len * 2 # Report double the length
-
-        def __getitem__(self, idx):
-            """
-            Gets an image by index. Handles returning either the original or a flipped version.
-
-            Args:
-                idx (int): Index of the item to retrieve (0 to 2*original_len - 1).
-
-            Returns:
-                torch.Tensor: The transformed image tensor.
-            """
-            # Determine if this index corresponds to a flipped image
-            should_flip = idx >= self.original_len
-
-            # Calculate the index of the original image file
-            original_idx = idx % self.original_len
-
-            # Construct the image path
-            img_path = os.path.join(self.folder_path, self.image_files[original_idx])
-
-            try:
-                # Load the PIL image
-                image = Image.open(img_path).convert("RGB")
-
-                # Apply horizontal flip if needed, *before* other transforms
-                if should_flip:
-                    image = TF.hflip(image) # Apply horizontal flip functionally
-
-                # Apply the main transformations (Resize, ToTensor, Normalize)
-                transformed_image = self.transform(image)
-
-                return transformed_image
-
-            except Exception as e:
-                # Handle potential errors during loading or transforming
-                print(f"Error loading or processing image at index {idx} (original file: {img_path}): {e}") # write message on console
-                # Return a dummy tensor or raise an error, depending on desired behavior
-                # Example: return torch.zeros((3, args.img_size, args.img_size)) # Ensure args.img_size is accessible or pass it
-                raise e # Or re-raise the exception
+    # --- Freeze VAE ---
+    vae.eval() # Set VAE to evaluation mode
+    for param in vae.parameters():
+        param.requires_grad = False
+    print("VAE model frozen.") # write message on console
 
     # Create the dataset with the specified folder
     train_dataset = SimpleImageDataset(folder_path='./simpler_data', img_size=args.img_size)
@@ -110,8 +65,8 @@ def main(args):
         device=device
     )
     unet_model = UNet(
-        in_channels=args.img_channels,
-        out_channels=args.img_channels,
+        in_channels=args.latent_dim,
+        out_channels=args.latent_dim,
         base_dim=args.unet_base_dim,
         dim_mults=tuple(args.unet_dim_mults),
         num_resnet_blocks=3
@@ -165,6 +120,7 @@ def main(args):
     try:
         diffusion_helper.train_with_accumulation(
             dataset=train_loader,
+            vae=vae,
             model=unet_model,
             accumulator=accumulator,
             optimizer=optimizer,
@@ -188,7 +144,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Diffusion Model (Simplified Dataset, Hardcoded Path)")
     # Dataset args
     parser.add_argument('--img_size', type=int, default=32, help='Target image size')
-    parser.add_argument('--img_channels', type=int, default=3, help='Number of image channels')
+    parser.add_argument('--laten_dim', type=int, default=3, help='Number of image channels')
     # Training args
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
@@ -198,7 +154,9 @@ if __name__ == "__main__":
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader worker processes')
     # Diffusion args
     parser.add_argument('--timesteps', type=int, default=1000, help='Number of diffusion timesteps')
-    parser.add_argument('--weights_path', type=str, default="/home/hoang/python/pytorch_diffusion/temp_checkpoints/20250329-142504/diffusion_model_best.pth", help='Path to pre-trained model weights')
+    parser.add_argument('--weights_path', type=str, default="/media/hoangdv/temp_checkpoints/20250329-142504/diffusion_model_best.pth", help='Path to pre-trained model weights')
+    # VAE args
+    parser.add_argument('--vae_weights_path', type=str, default="/media/hoangdv/vae_checkpoints/20250329-142504/vae_model_best.pth", help='Path to pre-trained VAE weights')
     # UNet args
     parser.add_argument('--unet_base_dim', type=int, default=256, help='Base channel dimension for UNet')
     parser.add_argument('--unet_dim_mults', type=int, nargs='+', default=[1, 2, 4], help='Channel multipliers for UNet')
@@ -228,4 +186,4 @@ if __name__ == "__main__":
     print(f"--------------------") # write message on console
 
     # Call the main function
-    main(args)
+    train_diffusion(args)
