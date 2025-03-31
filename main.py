@@ -9,8 +9,8 @@ import bitsandbytes as bnb
 import argparse
 # Import PIL.Image for loading images
 from PIL import Image
-from unet_test import UNet
-from diffusion_test import DiffusionModelPyTorch, GradientAccumulatorPyTorch, ImageGenerator
+from unet import UNet
+from diffusion import DiffusionModelPyTorch, GradientAccumulatorPyTorch, ImageGenerator
 
 def main(args):
     """
