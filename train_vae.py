@@ -18,14 +18,14 @@ except ImportError:
     raise ImportError("Error: Ensure VAE class definition is available (e.g., in vae_architecture.py)") # write error message on console
 
 # --- VAE Loss Function ---
-def vae_loss_function(recon_x, x, mu, log_var, lpips_loss_fn, kl_weight=1.0, l1_weight=1.0, lpips_weight=0.5):
+def vae_loss_function(recon_x, x, mean, log_var, lpips_loss_fn, kl_weight=1e-4, l1_weight=1.0, lpips_weight=0.2):
     """
     Calculates the VAE loss: L1 Reconstruction Loss + LPIPS Loss + KL Divergence Loss.
 
     Args:
         recon_x: Reconstructed input data (output of decoder). [-1, 1] range.
         x: Original input data. [-1, 1] range.
-        mu: Mean of the latent distribution (output of encoder).
+        mean: Mean of the latent distribution (output of encoder).
         log_var: Log variance of the latent distribution (output of encoder).
         lpips_loss_fn: Instantiated LPIPS loss function.
         kl_weight: Weight factor for the KL divergence term.
@@ -41,13 +41,12 @@ def vae_loss_function(recon_x, x, mu, log_var, lpips_loss_fn, kl_weight=1.0, l1_
     # Perceptual Loss (LPIPS)
     # LPIPS expects input in range [-1, 1], which matches our normalization
     perceptual_loss = lpips_loss_fn(recon_x, x).mean() # LPIPS outputs per-image loss, take mean over batch
-
     # Combined Reconstruction Loss
     recon_loss_combined = l1_weight * l1_loss + lpips_weight * perceptual_loss
 
     # KL Divergence Loss
-    # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-    kl_div = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=[1, 2, 3]) # Sum over C, H, W
+    # 0.5 * sum(1 + log(sigma^2) - mean^2 - sigma^2)
+    kl_div = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp(), dim=[1, 2, 3]) # Sum over C, H, W
     kl_div = torch.mean(kl_div) # Average over batch size
 
     # Total Loss
@@ -62,12 +61,19 @@ def train_vae(args):
     Main function to train the VAE model with gradient accumulation.
     """
     # --- Setup ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}") # write message on console
 
     time = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = os.path.join(args.log_dir, time)
     checkpoint_dir = os.path.join(args.checkpoint_dir, time)
+
+    if args.static_log_dir is not None:
+        print(f"Using static log directory: {args.static_log_dir}") # write message on console
+        log_dir = args.static_log_dir
+    if args.static_checkpoint_dir is not None:
+        print(f"Using static checkpoint directory: {args.static_checkpoint_dir}") # write message on console
+        checkpoint_dir = args.static_checkpoint_dir
     # Create directories if they don't exist
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
@@ -95,7 +101,7 @@ def train_vae(args):
     model = VAE(
         latent_dim=args.latent_dim,
         in_channels=3,
-        out_channels=3
+        out_channels=3,
         # Add other args like num_resnet_blocks if your VAE class needs them
     ).to(device)
     print("VAE model initialized.") # write message on console
@@ -121,9 +127,15 @@ def train_vae(args):
     # --- Training Loop ---
     import time
     start_time = time.time()
+    start_epoch = 0
+    best_loss = float('inf')
     print(f"Starting VAE training for {args.epochs} epochs...") # write message on console
-
-    start_epoch, best_loss = DiffusionModelPyTorch.load_checkpoint_for_resume(device=device, model=model, optimizer=optimizer, checkpoint_path=os.path.join(checkpoint_dir, "vae_best.pth"))
+    if args.best_dir is not None:
+        start_epoch, best_loss = DiffusionModelPyTorch.load_checkpoint_for_resume(device=device, model=model, optimizer=optimizer, checkpoint_path=os.path.join(args.best_dir, "vae_best.pth"))
+    if args.start_epoch is not None:
+        start_epoch = args.start_epoch
+        print(f"Start training from epoch {start_epoch}...")
+        best_loss = float('inf')
     global_step = start_epoch * len(train_loader)
 
     for epoch in range(start_epoch, args.epochs):
@@ -180,7 +192,6 @@ def train_vae(args):
             writer.add_scalar('Loss/L1_Step', l1_loss.item(), global_step)
             writer.add_scalar('Loss/LPIPS_Step', perceptual_loss.item(), global_step)
             writer.add_scalar('Loss/KL_Step', kl_loss.item(), global_step)
-
             # Update progress bar description (with unscaled loss)
             progress_bar.set_postfix({
                 "Total Loss": f"{total_loss.item():.4f}",
@@ -192,10 +203,11 @@ def train_vae(args):
             global_step += 1
 
         # --- End of Epoch ---
-        avg_epoch_loss = epoch_loss / len(train_loader)
-        avg_l1_loss = epoch_l1_loss / len(train_loader)
-        avg_lpips_loss = epoch_lpips_loss / len(train_loader)
-        avg_kl_loss = epoch_kl_loss / len(train_loader)
+        lenght = len(train_loader)
+        avg_epoch_loss = epoch_loss / lenght
+        avg_l1_loss = epoch_l1_loss / lenght
+        avg_lpips_loss = epoch_lpips_loss / lenght
+        avg_kl_loss = epoch_kl_loss / lenght
 
         print(f"Epoch {epoch+1}/{args.epochs} - "
               f"Avg Loss: {avg_epoch_loss:.4f}, "
@@ -214,7 +226,7 @@ def train_vae(args):
             best_loss = avg_epoch_loss
             print(f"New best loss! Saving model checkpoint to {checkpoint_dir}")
             torch.save({
-                'epoch': epoch + 1,
+                'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_epoch_loss,
@@ -226,7 +238,7 @@ def train_vae(args):
             # Ensure model state is saved correctly (no DDP wrapper here)
             model_state_to_save = model.state_dict()
             torch.save({
-                'epoch': epoch + 1,
+                'epoch': epoch,
                 'model_state_dict': model_state_to_save,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_epoch_loss,
@@ -243,25 +255,29 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a Variational Autoencoder (VAE) with L1+LPIPS Loss and Gradient Accumulation")
 
     # Dataset and Model Args
-    parser.add_argument('--image_folder', type=str, default='/media/hoangdv/simpler_data', required=True, help='Path to the folder containing training images')
+    parser.add_argument('--image_folder', type=str, default="/media/hoangdv/simpler_data", help='Path to the folder containing training images')
     parser.add_argument('--img_size', type=int, default=256, help='Target image size (resized to img_size x img_size)')
     parser.add_argument('--latent_dim', type=int, default=4, help='Dimension of the VAE latent space (encoder output channels will be 2*latent_dim)')
     # Add args for VAE architecture if needed
 
     # Training Args
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=64, help='Micro-batch size (for gradient accumulation)')
-    parser.add_argument('--accumulation_steps', type=int, default=8, help='Number of steps to accumulate gradients over. Effective batch size = batch_size * accumulation_steps') # New Arg
+    parser.add_argument('--batch_size', type=int, default=16, help='Micro-batch size (for gradient accumulation)')
+    parser.add_argument('--start_epoch', type=int, default=None, help='Starting epoch for training (for resuming)') # New Arg
+    parser.add_argument('--accumulation_steps', type=int, default=32, help='Number of steps to accumulate gradients over. Effective batch size = batch_size * accumulation_steps') # New Arg
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Optimizer learning rate')
-    parser.add_argument('--kl_weight', type=float, default=1.0, help='Weight for the KL divergence term in the VAE loss')
+    parser.add_argument('--kl_weight', type=float, default=1e-4, help='Weight for the KL divergence term in the VAE loss')
     parser.add_argument('--l1_weight', type=float, default=1.0, help='Weight for the L1 reconstruction loss term')
-    parser.add_argument('--lpips_weight', type=float, default=0.5, help='Weight for the LPIPS perceptual loss term')
+    parser.add_argument('--lpips_weight', type=float, default=1.0, help='Weight for the LPIPS perceptual loss term')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of DataLoader worker processes')
 
     # Logging and Saving Args
+    parser.add_argument('--static_checkpoint_dir', type=str, default=None, help='Directory to save model checkpoints')
+    parser.add_argument('--static_log_dir', type=str, default=None, help='Directory for TensorBoard logs')
     parser.add_argument('--checkpoint_dir', type=str, default='/media/hoangdv/vae_checkpoints', help='Directory to save model checkpoints')
     parser.add_argument('--log_dir', type=str, default='/media/hoangdv/vae_logs', help='Directory for TensorBoard logs')
     parser.add_argument('--save_interval', type=int, default=10, help='Save checkpoint every N epochs')
+    parser.add_argument('--best_dir', type=str, default='/media/hoangdv/vae_checkpoints/20250402-150029', help='Directory to load best model checkpoint')
 
     args = parser.parse_args()
 

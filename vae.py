@@ -19,8 +19,11 @@ class VAEEncoder(nn.Module):
         self.resnet_block_3 = self._make_layer(ResidualBlock, 256, 512, num_resnet_blocks)
 
         self.attention1 = MultiHeadAttentionBlock(512, num_attention_heads)
+        self.resnet_block_4 = self._make_layer(ResidualBlock, 512, 512, num_resnet_blocks)
+        self.attention2 = MultiHeadAttentionBlock(512, num_attention_heads)
+        self.resnet_block_out = self._make_layer(ResidualBlock, 512, 2 * latent_dim, num_resnet_blocks)
 
-        self.conv_out = nn.Conv2d(512, 2 * latent_dim, kernel_size=3, padding=1)
+        self.conv_out_ = nn.Conv2d(2 * latent_dim, 2 * latent_dim, kernel_size=3, padding=1)
 
     def _make_layer(self, block, in_channels, out_channels, num_blocks):
         layers = []
@@ -53,8 +56,16 @@ class VAEEncoder(nn.Module):
         # (batch_size, 512, height / 8, width / 8) -> (batch_size, 512, height / 8, width / 8)
         x = self.attention1(x)
 
+        # (batch_size, 512, height / 8, width / 8) -> (batch_size, 512, height / 8, width / 8)
+        x = self.resnet_block_4(x)
+
+        # (batch_size, 512, height / 8, width / 8) -> (batch_size, 512, height / 8, width / 8)
+        x = self.attention2(x)
+        # (batch_size, 512, height / 8, width / 8) -> (batch_size, 512, height / 8, width / 8)
+        x = self.resnet_block_out(x)
+
         # (batch_size, 512, height / 8, width / 8) -> (batch_size, 2 * latent_dim, height / 8, width / 8)
-        x = self.conv_out(x)
+        x = self.conv_out_(x)
         # The output of the last conv layer contains both mean and log variance
         mean, log_var = torch.chunk(x, 2, dim=1)
 
@@ -65,7 +76,10 @@ class VAEEncoder(nn.Module):
 class VAEDecoder(nn.Module):
     def __init__(self, latent_dim: int = 4, out_channels: int = 3, num_resnet_block=3, num_attention_heads=4):
         super().__init__()
-        self.conv_in = nn.Conv2d(latent_dim, 512, kernel_size=3, padding=1)
+        self.conv_in_ = nn.Conv2d(latent_dim, latent_dim, kernel_size=3, padding=1)
+        self.resnet_block_in = self._make_layer(ResidualBlock, latent_dim, 512, num_resnet_block)
+        self.attention1 = MultiHeadAttentionBlock(512, num_attention_heads)
+        self.resnet_block_0 = self._make_layer(ResidualBlock, 512, 512, num_resnet_block)
         self.attention = MultiHeadAttentionBlock(512, num_attention_heads)
 
         # 4 upsample blocks, suppose the input size is 256x256
@@ -78,7 +92,7 @@ class VAEDecoder(nn.Module):
         self.resnet_block_3 = self._make_layer(ResidualBlock, 128, 64, num_resnet_block)
         self.upsample3 = self._make_upsample_block(64)  # 128x128 → 256x256
 
-        self.resnet_block_4 = self._make_layer(ResidualBlock, 64, 64, num_resnet_block - 1)
+        self.resnet_block_4 = self._make_layer(ResidualBlock, 64, 64, num_resnet_block)
 
         self.conv_out = nn.Conv2d(64, out_channels, kernel_size=3, padding=1)
 
@@ -106,8 +120,12 @@ class VAEDecoder(nn.Module):
             the output tensor of shape (batch_size, out_channels, height, width)
         """
 
-        # (batch_size, latent_dim, h/8, w/8) -> (batch_size, 512, h/8, w/8)
-        x = self.conv_in(z)
+        # (batch_size, latent_dim, h/8, w/8) -> (batch_size, latent_dim, h/8, w/8)
+        x = self.conv_in_(z)
+        x = self.resnet_block_in(x)  # [batch, 512, h/8, w/8]
+        x = self.attention1(x)
+        x = self.resnet_block_0(x)
+        # (batch_size, 512, h/8, w/8) -> (batch_size, 512, h/8, w/8)
         x = self.attention(x)  # [batch, 512, h/8, w/8]
 
         # --- Block 1: 32x32 -> 64x64 ---
@@ -131,7 +149,7 @@ class VAEDecoder(nn.Module):
 
 class VAE(nn.Module):
     
-    def __init__(self, latent_dim: int, in_channels: int = 3, out_channels: int = 3, 
+    def __init__(self, latent_dim: int = 4, in_channels: int = 3, out_channels: int = 3, 
                  num_resnet_blocks: int = 3, num_attention_heads: int = 4):
         super().__init__()
         
@@ -147,8 +165,9 @@ class VAE(nn.Module):
         """Decode latent vector to reconstruction"""
         return self.decoder(z)
 
-    def reparameterize(self, mean, var, noise=None):
+    def reparameterize(self, mean, log_var, noise=None):
         """Sample from the latent distribution using the reparameterization trick"""
+        var = torch.exp(log_var)
         std = torch.sqrt(var)
         if noise:
             eps = noise
@@ -163,13 +182,13 @@ class VAE(nn.Module):
         Args:
             x: Input tensor of shape (batch_size, in_channels, height, width)
         Returns:
-            Reconstructed tensor and parameters of the latent distribution (mean, var)
+            Reconstructed tensor and parameters of the latent distribution (mean, log_var)
         """
-        mean, var = self.encode(x)
-        z = self.reparameterize(mean, var)
+        mean, log_var = self.encode(x)
+        z = self.reparameterize(mean, log_var)
         x_recon = self.decode(z)
         
-        return x_recon, mean, var
+        return x_recon, mean, log_var
 
     def sample(self, num_samples: int, height: int, width: int, device: torch.device):
         """
@@ -181,5 +200,7 @@ class VAE(nn.Module):
         """
         latent_h, latent_w = height // 8, width // 8
         z = torch.randn(num_samples, self.latent_dim, latent_h, latent_w, device=device)
-        samples = self.decode(z)
+        samples = self.decode(z) # [-1, 1]
+        samples = torch.clamp(samples, -1, 1)
+        samples = (samples + 1) / 2
         return samples

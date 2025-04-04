@@ -474,13 +474,11 @@ class DiffusionModelPyTorch:
     @staticmethod
     def load_checkpoint_for_resume(device, model, optimizer, checkpoint_path):
         """
-        Load a full checkpoint for resuming training, performing loading
-        operations on the CPU to avoid GPU OOM, then moving the model
-        back to the target device (device).
+        Load a full checkpoint for resuming training directly onto the target device.
 
         Args:
-            device (str or torch.device): The target device for the model.
-            model (nn.Module): The model instance (should ideally be on CPU initially).
+            device (str or torch.device): The target device for the model and checkpoint tensors (e.g., 'cuda:0').
+            model (nn.Module): The model instance.
             optimizer (torch.optim.Optimizer): The optimizer instance.
             checkpoint_path (str): Path to the checkpoint file (.pth).
 
@@ -491,40 +489,46 @@ class DiffusionModelPyTorch:
         """
         start_epoch = 0
         loaded_loss = float('inf')
-        original_device = next(model.parameters()).device # Remember the model's original device (likely CPU if called correctly)
 
-        # Ensure model is on CPU before loading state dicts from a CPU-loaded checkpoint
-        model.to('cpu')
-        print(f"Temporarily moved model to CPU for loading.")
-
+        # Ensure model is on the target device before attempting to load
+        model.to(device)
+        print(f"Ensuring model is on device: {device}")
 
         # Check if the checkpoint file exists
         if os.path.isfile(checkpoint_path):
-            print(f"Loading checkpoint for resume from: {checkpoint_path} onto CPU")
+            print(f"Loading checkpoint for resume from: {checkpoint_path} directly onto {device}")
             try:
-                # --- Step 1: Load the entire checkpoint dictionary onto CPU ---
+                # --- Step 1: Load the entire checkpoint dictionary directly onto the target device ---
                 checkpoint = torch.load(
                     checkpoint_path,
-                    map_location='cpu', # <<< Load all tensors in the checkpoint to CPU memory
+                    map_location=device, # <<< Load tensors directly onto the target device
                     weights_only=False   # <<< Keep this False to load optimizer state etc.
                 )
-                print("Checkpoint dictionary loaded to CPU memory.")
+                print(f"Checkpoint dictionary loaded directly to {device} memory.")
 
-                # --- Step 2: Load model state dict while model is on CPU ---
-                model.load_state_dict(checkpoint['model_state_dict'])
-                print("Model state loaded successfully onto CPU model.")
+                # --- Step 2: Load model state dict (model is already on target device) ---
+                missing_keys, unexpected_keys = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                if missing_keys:
+                    print("\nMissing keys (expected for new layers):")
+                    for key in missing_keys:
+                        print(key)
+
+                if unexpected_keys:
+                    print("\nUnexpected keys (should ideally be empty):")
+                    for key in unexpected_keys:
+                        print(key)
+                print(f"Model state loaded successfully onto model on {device}.")
 
                 # --- Step 3: Load optimizer state dict ---
-                # The optimizer state is associated with model parameters.
-                # Since the model is currently on CPU, loading the optimizer state
-                # (which was also loaded to CPU by map_location='cpu') works here.
+                # Optimizer state will also be loaded onto the target device if parameters are there.
                 if 'optimizer_state_dict' in checkpoint and optimizer is not None:
                     try:
+                        # Optimizer states are tied to specific parameters. Ensure they are loaded
+                        # correctly when the model parameters are already on the target device.
                         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                        print("Optimizer state loaded successfully (references CPU parameters for now).")
+                        print(f"Optimizer state loaded successfully (references parameters on {device}).")
                     except Exception as optim_load_err:
                          print(f"Error loading optimizer state: {optim_load_err}")
-                         # Decide if you want to proceed without optimizer state or re-raise
                          print("Warning: Optimizer state loading failed. Optimizer will start from scratch.")
                 elif optimizer is None:
                      print("Warning: Optimizer not provided, skipping optimizer state loading.")
@@ -545,28 +549,24 @@ class DiffusionModelPyTorch:
                 else:
                      print("Info: Loss value not found in checkpoint.")
 
-                # --- Step 5: Move the model back to the target device (e.g., CUDA) ---
-                # This needs to happen AFTER successfully loading state dicts.
-                model.to(device)
-                print(f"Model moved back to target device: {device}")
-                # NOTE: The optimizer's state (buffers) will implicitly move with the
-                # parameters when the model is moved. No explicit optimizer.to(self.device) is usually needed.
+                # --- Step 5: Model is already on the target device ---
+                # No need to move it again if loading was successful.
 
             except Exception as e:
                 print(f"Error loading checkpoint: {e}")
                 print("Starting training from scratch due to error during loading.")
-                # Attempt to move model back to original device even if loading failed
+                # Ensure model is on target device even if loading failed
                 try:
-                     model.to(device)
-                     print(f"Model moved back to target device '{device}' after loading error.")
+                     model.to(device) # Ensure it's on the correct device
+                     print(f"Model ensured to be on target device '{device}' after loading error.")
                 except Exception as move_err:
-                     print(f"Could not move model back to target device after error: {move_err}")
+                     print(f"Could not ensure model is on target device after error: {move_err}")
                 start_epoch = 0
                 loaded_loss = float('inf')
         else:
             print(f"Checkpoint file not found at {checkpoint_path}. Starting training from scratch.")
             # Ensure model is on the correct device if starting from scratch
-            model.to(device)
+            model.to(device) # Already called at the beginning, but good for clarity
             print(f"Model ensured to be on target device '{device}' when starting fresh.")
             start_epoch = 0
             loaded_loss = float('inf')
@@ -620,7 +620,7 @@ class ImageGenerator:
               f"and prediction_type='velocity'.")
 
     @torch.no_grad()
-    def generate_images(self, model, num_images=1, num_inference_steps=50):
+    def generate_images(self, model, num_images=1, num_inference_steps=100):
         """
         Generate images using the diffusion model with the configured scheduler.
 
